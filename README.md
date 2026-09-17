@@ -62,9 +62,15 @@ Why it matters, and it is bigger than it sounds: **a phone at arm's length
 subtends about 12 degrees.** Turn your head 17 — which is nothing, it is
 glancing at someone beside you — and the point your eyes must aim at swings by
 more than a screen width. Head movement is not a small perturbation on eye
-movement here, it is the dominant term. In simulation, the flat model goes from
-3.6% error with a still head to unusable with a moving one; the pose model
-holds around 5%.
+movement here, it is the dominant term. In simulation, on held-out points: with a
+still head both sit near 3.6% of the screen. Slide your head without turning it
+— what a hand-held phone does constantly — and flat goes to 13.7% while pose
+stays at 3.8%. Turn as well and flat becomes unusable.
+
+**If the two feel identical, the head pass was done too still.** The HUD shows
+how far the head moved during calibration, and a live `split` readout of how
+far apart the two models are right now. If split sits near zero they really are
+the same model, and recalibrating with more head movement is the fix.
 
 That is also why propping the phone against something transforms it. Not that
 the tracker needs a still head — that it could not *see* the head move.
@@ -104,13 +110,14 @@ loaded from a pinned CDN URL.
 
 ```sh
 npm start     # static server on :8123
-npm test      # 273 headless checks: maths, directions, wiring
+npm test      # 292 headless checks: maths, directions, wiring
 ```
 
-`npm test` runs in node with nothing installed. It has already caught three
-real bugs — a ridge penalty quietly flattening the vertical axis, a relative
-import resolving against the wrong base, and a calibration that collected 415
-samples and then silently discarded every one of them.
+`npm test` runs in node with nothing installed. It has already caught four real
+bugs — a ridge penalty flattening the vertical axis, the same penalty switching
+off every head-position feature, a relative import resolving against the wrong
+base, and a calibration that collected 415 samples and silently discarded all
+of them.
 
 ```sh
 npm run vendor        # pull MediaPipe + the model local (~40MB, gitignored)

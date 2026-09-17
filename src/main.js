@@ -48,6 +48,8 @@ const state = {
   models: {},
   meta: {},
   active: 'flat',
+  spread: null,
+  split: null,
   cal: null,
   shownPass: 0,
   calHoldUntil: 0,
@@ -86,7 +88,10 @@ async function boot() {
     await state.tracker.load(status);
 
     const saved = loadCalibration();
-    if (saved) { state.models = saved.models; state.meta = saved.meta || {}; state.active = saved.active; }
+    if (saved) {
+      state.models = saved.models; state.meta = saved.meta || {};
+      state.active = saved.active; state.spread = saved.spread || null;
+    }
 
     el.boot.classList.add('gone');
     keepAwake();
@@ -189,6 +194,17 @@ function updateGaze(f, dt) {
   }, dt);
 
   state.gaze = { x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) };
+
+  // How far apart the two models think you are looking, right now, in percent
+  // of the screen. This is the number that settles "they seem the same": if it
+  // sits near zero they ARE the same, and the head pass is what to fix. It
+  // should grow as you move your head and shrink toward zero when you hold
+  // still, because that is the only thing they disagree about.
+  if (state.models.flat && state.models.pose && f.pose) {
+    const a = predict(state.models.flat, f), b = predict(state.models.pose, f);
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    state.split = state.split == null ? d : state.split + (d - state.split) * 0.08;
+  }
 }
 
 // The intro card holds for a beat before the first dot. Two reasons: the eyes
@@ -214,7 +230,7 @@ function runCalibration(dt, f, now) {
   // as another still pass and the head terms end up as dead as they were.
   if (state.cal.pass !== state.shownPass) {
     state.shownPass = state.cal.pass;
-    state.calHoldUntil = now + 2100;
+    state.calHoldUntil = now + 2600;
     showCalCard(state.cal.pass);
   }
   if (now < state.calHoldUntil) return;
@@ -227,7 +243,7 @@ function runCalibration(dt, f, now) {
   state.cal = null;
   document.body.classList.remove('calibrating');
 
-  const fitted = Object.entries(r).filter(([, v]) => v.ok);
+  const fitted = Object.entries(r).filter(([k, v]) => k !== 'spread' && v?.ok);
   if (!fitted.length) {
     const why = Object.values(r)[0]?.reason || 'no samples';
     note(`calibration failed (${why}) — keep your face in frame and try again`, true);
@@ -242,13 +258,25 @@ function runCalibration(dt, f, now) {
   // Land on the head-aware one when it fitted, since it is the one that was
   // just paid for with an extra pass. The button flips straight back.
   state.active = state.models.pose ? 'pose' : 'flat';
-  saveCalibration({ models: state.models, meta: state.meta, active: state.active });
+  state.spread = r.spread;
+  saveCalibration({ models: state.models, meta: state.meta, active: state.active, spread: r.spread });
   state.filter.reset();
-
-  const line = fitted.map(([set, v]) => `${set} ${(v.rmse.mean * 100).toFixed(1)}%`).join(' · ');
-  note(`calibrated — ${line} · tap "model" to compare`);
-  if (!r.pose?.ok) note(`calibrated (${(r.flat.rmse.mean * 100).toFixed(1)}%) — no head pose from the mesh, so the pose model was skipped`, true);
   setMode('gaze');
+
+  // The one thing worth saying out loud. If the head barely moved during the
+  // second pass then the head terms had nothing to learn from, the two models
+  // are the same model, and flipping between them will feel like nothing is
+  // happening — which is indistinguishable from the idea not working unless
+  // somebody says so.
+  if (!r.pose?.ok) {
+    note(`calibrated (${(r.flat.rmse.mean * 100).toFixed(1)}%) — no head pose from the mesh, so only the basic model fitted`, true);
+  } else if (r.spread && !r.spread.enough) {
+    note(`your head barely moved on the last four dots (${(r.spread.yaw * 57).toFixed(0)}° of turn) — ` +
+         `so both models came out the same. Recalibrate and move more on the amber dots.`, true);
+  } else {
+    const line = fitted.map(([set, v]) => `${set} ${(v.rmse.mean * 100).toFixed(1)}%`).join(' · ');
+    note(`calibrated — ${line} · head pass ${(r.spread.yaw * 57).toFixed(0)}° · tap "model" to compare`);
+  }
 }
 
 function showCalCard(pass) {
@@ -338,9 +366,16 @@ function updateHud(f, now) {
     ? `yaw${deg(f.pose.yaw)} pit${deg(f.pose.pitch)} rol${deg(f.pose.roll)} d${f.pose.dist.toFixed(1)}`
     : '<span class="warn">no head pose</span>';
 
+  // "split" is how far apart the two models are RIGHT NOW. Near zero means
+  // they are the same model and switching between them cannot do anything.
+  const split = state.split != null
+    ? ` · split <b class="${state.split < 0.01 ? 'warn' : ''}">${(state.split * 100).toFixed(1)}%</b>`
+    : '';
+
   el.hud.innerHTML = [
     `${live ? 'face' : '<b class="warn">no face</b>'} · ${state.tracker.delegate || '—'} · ${state.detFps.toFixed(0)}/${state.fps.toFixed(0)} fps`,
     `<span class="${m ? '' : 'warn'}">${cal}</span>${other ? ` <span class="dim">(${other})</span>` : ''}${state.blinking ? ' · <b>blink</b>' : ''}`,
+    `${state.spread ? `head pass ${(state.spread.yaw * 57).toFixed(0)}°${state.spread.enough ? '' : ' <b class="warn">TOO STILL</b>'}` : ''}${split}`,
     f?.ok ? `gx ${f.gx.toFixed(3)} gy ${f.gy.toFixed(3)} asy ${f.asym.toFixed(3)}` : (f?.reason ? `— ${f.reason}` : '—'),
     pose,
   ].join('<br>');
@@ -391,7 +426,8 @@ el.bar.addEventListener('click', e => {
       break;
     }
     case 'reset':
-      clearCalibration(); state.models = {}; state.meta = {}; state.rest = null; state.filter.reset();
+      clearCalibration(); state.models = {}; state.meta = {};
+      state.spread = null; state.split = null; state.rest = null; state.filter.reset();
       note('calibration cleared');
       break;
     case 'clear': {

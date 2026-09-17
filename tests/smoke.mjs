@@ -216,12 +216,25 @@ try {
   check('  and says what is different about it',
     /move your head/i.test(await page.locator('#calintro').textContent()));
 
-  await page.waitForFunction('!window.__eye.state.cal && Object.keys(window.__eye.state.models).length', null, { timeout: 90000 });
+  await page.waitForFunction('!window.__eye.state.cal && Object.keys(window.__eye.state.models).length', null, { timeout: 120000 });
   const fitted = await page.evaluate('({ sets: Object.keys(__eye.state.models), active: __eye.state.active, meta: __eye.state.meta })');
   check('both models are fitted from the one calibration',
     fitted.sets.includes('flat') && fitted.sets.includes('pose'), JSON.stringify(fitted.sets));
   check('it lands on the head-aware one', fitted.active === 'pose', fitted.active);
   check('both have a residual', fitted.meta.flat?.rmse < 0.05 && fitted.meta.pose?.rmse < 0.05, JSON.stringify(fitted.meta));
+
+  // The diagnostics that exist so "they feel the same" can be checked rather
+  // than guessed at: how much the head actually moved, and how far apart the
+  // two models are right now.
+  const spread = await page.evaluate('({ ...__eye.state.spread })');
+  check('the head pass spread is recorded', spread.yaw > 0.3, JSON.stringify(spread));
+  check('  and judged sufficient', spread.enough === true);
+  await page.evaluate(`window.__head = { yaw: 0.25, pitch: 0.12, tx: 0.2, ty: 0.12 }`);
+  await sleep(1800);
+  const split = await page.evaluate('__eye.state.split');
+  check('the two models visibly disagree with the head turned', split > 0.02, `split ${split}`);
+  check('  and the HUD shows it', /split/.test(await page.locator('#hud').textContent()));
+  await page.evaluate(`window.__head = { yaw: 0, pitch: 0, tx: 0, ty: 0 }`);
   check('it survives into localStorage', await page.evaluate(`!!localStorage.getItem('eye.calibration.v3')`));
 
   // The toggle is the entire reason both models are kept.

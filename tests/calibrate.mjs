@@ -164,6 +164,20 @@ const MOVING = () => ({
   check('the pose model shrugs off a small head movement', poseG.mean < 0.05,
     `${(poseG.mean * 100).toFixed(2)}%`);
 
+  // SLIDING WITHOUT TURNING is the case a hand-held phone produces constantly,
+  // and it is the one that only `faceX`, `faceY` and `span` can see — every
+  // rotation feature reads identically through it. It is therefore the check
+  // that fails if those three ever get regularised back into uselessness,
+  // which is exactly what was happening before solveRidge centred its columns:
+  // pose measured 13.7% here, barely better than the flat model's 13.7%.
+  const slide = () => ({ tx: (rnd() - 0.5) * 0.6, ty: (rnd() - 0.5) * 0.5 });
+  const flatS = evaluate(trained.result.flat.model, { heads: slide });
+  const poseS = evaluate(trained.result.pose.model, { heads: slide });
+  check('sliding the head defeats the flat model', flatS.mean > 0.09, `${(flatS.mean * 100).toFixed(2)}%`);
+  check('the pose model handles a pure slide', poseS.mean < 0.055, `${(poseS.mean * 100).toFixed(2)}%`);
+  check('  which is a 3x improvement, and it is the handheld case',
+    poseS.mean * 3 < flatS.mean, `pose ${(poseS.mean * 100).toFixed(2)}% vs flat ${(flatS.mean * 100).toFixed(2)}%`);
+
   const flat = evaluate(trained.result.flat.model, { heads: MOVING });
   const pose = evaluate(trained.result.pose.model, { heads: MOVING });
   check('a freely moving head leaves the flat model useless', flat.mean > 0.2,
@@ -174,6 +188,36 @@ const MOVING = () => ({
     `pose ${(pose.mean * 100).toFixed(2)}% vs flat ${(flat.mean * 100).toFixed(2)}%`);
   check('and the worst case improves too', pose.worst < flat.worst,
     `${(pose.worst * 100).toFixed(2)}% vs ${(flat.worst * 100).toFixed(2)}%`);
+}
+
+// ── THE HEAD PASS HAS TO ACTUALLY MOVE THE HEAD ─────────────────────────────
+// The failure everybody will hit. "Move your head a little" is vague, people
+// under-do it, and a head that stayed still produces a pose model numerically
+// identical to the flat one — which feels exactly like the idea not working.
+// So it is measured, and the app says so rather than leaving it to be guessed.
+{
+  const moved = runSequence();
+  check('a real head pass is recognised as enough', moved.result.spread.enough,
+    JSON.stringify(moved.result.spread));
+  check('  and reports a sensible spread of yaw', moved.result.spread.yaw > 0.3,
+    String(moved.result.spread.yaw));
+
+  const stillPass = runSequence({ still: true });
+  check('a head pass done without moving is caught', !stillPass.result.spread.enough,
+    JSON.stringify(stillPass.result.spread));
+  check('  and it is caught because the head really did not move',
+    stillPass.result.spread.yaw < 0.01, String(stillPass.result.spread.yaw));
+
+  // And the thing the warning is actually about: the two models come out the
+  // same, so the button that switches between them does nothing.
+  const at = m => predict(m, look(0.2, 0.3, { yaw: 0.2, tx: 0.15 }));
+  const a = at(stillPass.result.flat.model), b = at(stillPass.result.pose.model);
+  const moveA = at(moved.result.flat.model), moveB = at(moved.result.pose.model);
+  check('without movement the two models barely disagree',
+    Math.hypot(a.x - b.x, a.y - b.y) < 0.15, String(Math.hypot(a.x - b.x, a.y - b.y)));
+  check('with movement they disagree a lot, which is the point',
+    Math.hypot(moveA.x - moveB.x, moveA.y - moveB.y) > 0.3,
+    String(Math.hypot(moveA.x - moveB.x, moveA.y - moveB.y)));
 }
 
 // ── THE TWO HALVES ONLY WORK AS A PAIR ──────────────────────────────────────

@@ -67,6 +67,62 @@ import { check, near, report } from './harness.mjs';
 }
 
 
+// ── COLUMN OFFSET INVARIANCE ────────────────────────────────────────────────
+// The second half of the same lesson, and it hid behind the fix for the first.
+// Dividing by RMS made the penalty independent of a feature's UNITS. It left
+// it dependent on where the feature's ZERO happens to sit, because what a
+// ridge penalty really costs a column is its ability to explain variation, and
+// that is its standard deviation, not its RMS. Those are the same number only
+// for a zero-mean column.
+//
+// Adding a constant to a feature changes nothing about the information in it,
+// so it must change nothing about the prediction. Before centring it changed a
+// great deal: measured on the real design, std/RMS was 0.015 for `span`, so it
+// was penalised 67x harder than `gx` purely for being measured from a distant
+// origin, and its fitted contribution came out at 0.0002. It was switched off,
+// and the feature it switched off was the one that notices you sliding your
+// head sideways.
+//
+// Note what this would still pass with if it only checked that the fit works:
+// everything. The offset version fitted fine and reported a healthy residual —
+// it had just stopped using several of its features.
+{
+  const X = [], Xoff = [], Y = [];
+  for (let i = 0; i < 80; i++) {
+    const a = Math.sin(i * 1.3), b = Math.cos(i * 0.7) * 0.01;
+    X.push([1, a, b]);
+    Xoff.push([1, a + 50, b + 1000]);        // same features, distant origins
+    Y.push([2 + 0.5 * a + 30 * b]);
+  }
+  const W = solveRidge(X, Y, 1e-3);
+  const Wo = solveRidge(Xoff, Y, 1e-3);
+  for (let i = 0; i < X.length; i += 17) {
+    near('offsetting a column does not change the prediction', apply(W, X[i])[0], apply(Wo, Xoff[i])[0], 1e-6);
+  }
+  check('an offset feature is still actually fitted', rmse(Wo, Xoff, Y)[0] < 0.02, String(rmse(Wo, Xoff, Y)[0]));
+
+  // Both at once, which is the real case: every head feature has its own units
+  // AND its own origin.
+  const Wb = solveRidge(Xoff.map(r => [r[0], r[1] * 100, r[2] * 0.001]), Y, 1e-3);
+  near('offset and rescaled together still agrees',
+    apply(Wb, [1, (X[3][1] + 50) * 100, (X[3][2] + 1000) * 0.001])[0], apply(W, X[3])[0], 1e-6);
+}
+
+// ── A COLUMN THAT NEVER VARIES DROPS OUT ────────────────────────────────────
+// Centring turns a constant column into exactly zero, so it contributes
+// nothing and takes a zero coefficient. Uncentred it was a second intercept,
+// collinear with the first, and the two split a coefficient between them —
+// which is fine for the fit and confusing for anybody reading the weights to
+// work out what the model is using.
+{
+  const X = [], Y = [];
+  for (let i = 0; i < 40; i++) { const a = Math.sin(i); X.push([1, a, 7]); Y.push([3 + 2 * a]); }
+  const W = solveRidge(X, Y, 1e-3);
+  near('a constant column takes a zero coefficient', W[2][0], 0, 1e-9);
+  near('  and the intercept keeps the whole offset', W[0][0], 3, 0.02);
+  check('  and the fit is unharmed', rmse(W, X, Y)[0] < 0.02, String(rmse(W, X, Y)[0]));
+}
+
 // ── COLUMN SCALE INVARIANCE ─────────────────────────────────────────────────
 // This is the check the first version did not have, and its absence cost the
 // vertical axis. A ridge penalty is per-column, so a feature measured in small

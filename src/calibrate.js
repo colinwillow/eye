@@ -51,8 +51,48 @@ export const CAL = {
   // the confusion the cross terms have to resolve.
   headPoints: [[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]],
   headSettleMs: 500,
-  headCollectMs: 1700,
+  headCollectMs: 2200,
+
+  // How much the head has to actually MOVE during the second pass for the
+  // head-aware model to be worth anything.
+  //
+  // This is the failure everyone will hit, because "move your head a little"
+  // is a vague instruction and people under-do it. Move too little and the
+  // head terms have nothing to explain, ridge shrinks them, and the pose model
+  // comes out numerically identical to the flat one — at which point flipping
+  // between them feels like nothing is happening, because nothing is. That is
+  // indistinguishable from "the idea did not work", so it has to be MEASURED
+  // and said out loud rather than left to be inferred.
+  //
+  // Ranges, not deviations: 0.35 rad is a 20-degree spread of yaw across the
+  // pass, which is a small movement honestly done. The slide is a fraction of
+  // the frame width.
+  minSpread: { yaw: 0.35, pitch: 0.20, slide: 0.05 },
 };
+
+// What the head actually did during the second pass, as the total range each
+// feature covered.
+export function headSpread(samples) {
+  const p2 = samples.filter(s => s.pass === 2);
+  if (!p2.length) return null;
+  const range = get => {
+    let lo = Infinity, hi = -Infinity;
+    for (const s of p2) { const v = get(s); if (v == null || !Number.isFinite(v)) continue; if (v < lo) lo = v; if (v > hi) hi = v; }
+    return hi > lo ? hi - lo : 0;
+  };
+  const spread = {
+    yaw: range(s => s.f.pose?.yaw),
+    pitch: range(s => s.f.pose?.pitch),
+    slideX: range(s => s.f.faceX),
+    slideY: range(s => s.f.faceY),
+    n: p2.length,
+  };
+  spread.slide = Math.max(spread.slideX, spread.slideY);
+  spread.enough = spread.yaw >= CAL.minSpread.yaw ||
+                  spread.pitch >= CAL.minSpread.pitch ||
+                  spread.slide >= CAL.minSpread.slide;
+  return spread;
+}
 
 // Where the dots go, in 0..1 screen space, in the order they are shown.
 // Centre first so the first dot is the easy one and the person is settled
@@ -114,6 +154,7 @@ export function fitAll(samples, cfg = CAL) {
   return {
     flat: fit(still, 'flat', cfg),
     pose: fit(samples, 'pose', cfg),
+    spread: headSpread(samples),
   };
 }
 

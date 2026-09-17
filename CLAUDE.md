@@ -99,6 +99,24 @@ Three things follow, and they are why `features.js` looks the way it does:
   projects bigger. `asym` and `widthRatio` read that straight off the landmarks
   with no matrix involved, which is what the pose model falls back on.
 
+### The head pass must actually move the head, and this is MEASURED
+
+"Move your head a little" is vague and people under-do it. A head pass done
+too still gives the head terms nothing to explain, ridge shrinks them, and the
+pose model comes out numerically identical to the flat one. Flipping between
+them then feels like nothing is happening — because nothing is — and that is
+indistinguishable from the idea not working.
+
+So `headSpread()` records the total range of yaw, pitch and lateral slide over
+the second pass, `CAL.minSpread` says how much is enough, and the app says so
+out loud after calibrating and keeps it on the HUD. There is also a live
+**split** readout: how far apart the two models' predictions are right now, as
+a percentage of the screen. Near zero means they are the same model and the
+head pass is the thing to fix — not the features, not the fit.
+
+Anyone reporting "the two models feel the same" should be asked for those two
+numbers before anything else is changed.
+
 ### The features and the head pass only work as a PAIR
 
 Cross terms were in an early version and measured as worthless, because a
@@ -130,9 +148,11 @@ session without recalibrating in between. Two separate calibrations differ by
 how you sat and where the light was, and that is a bigger difference than the
 one being measured.
 
-`flat` is kept **bit-identical** on purpose. It is the version that was
-measured to work on a real phone, and a new idea does not get to quietly move
-the baseline it is supposed to beat.
+`flat`'s FEATURE SET is kept untouched on purpose — it is the version measured
+to work on a real phone, and a new idea does not get to quietly move the
+baseline it is supposed to beat. Solver fixes are the exception and apply to
+both: a bug in `solveRidge` is not a property of either model, and leaving the
+baseline broken to flatter the new one is not a comparison.
 
 Samples are stored as raw features rather than as built design rows, so a
 feature set added later can be fitted from a calibration collected before it
@@ -152,25 +172,47 @@ gets to maybe 1.5-2.5 cm; past that is a different model, not a better fit.
 
 Worth knowing before spending a week on a cleverer regression.
 
-## A ridge penalty is per-column, so the columns must be scaled
+## The regulariser has been the bug TWICE. Suspect it third.
 
-This cost a whole debugging pass and it is the kind of bug that produces a
-*plausible sentence*. The features are wildly different sizes: horizontal iris
-offset swings about +/-0.034 across a whole screen, vertical about +/-0.012,
-the quadratic terms about 1e-3, and head pose sits near 0.55. One flat lambda
-across that barely touches the big columns and shrinks the small ones to
-nothing.
+Both times the symptom was a model that fitted fine, reported a healthy
+residual, and had quietly stopped using some of its features. Both times the
+obvious reading was "that feature does not work", which is a plausible enough
+sentence about eye tracking to be believed and to send somebody looking for a
+better feature.
 
-Measured: the fit came out accurate horizontally and flat vertically. That
-reads as "vertical gaze tracking does not work", which is believable enough
-about eye tracking that the first version went looking for a better vertical
-feature. It was the regulariser.
+A ridge penalty is applied per column, so it only means the same thing to every
+column if the columns are comparable. `solveRidge` therefore **standardises**:
+centre, divide by standard deviation, solve, fold the shift back into the
+intercept. The intercept is left out of both — shrinking it biases every
+prediction toward the origin, which on a screen is the top-left corner.
 
-`solveRidge` now divides each column by its own RMS before solving and divides
-it back out afterwards, which makes lambda scale-free. The intercept is left
-out of both the scaling and the penalty — shrinking it biases every prediction
-toward the origin, which on a screen is the top-left corner.
-`tests/solve.mjs` pins this: rescaling a column must not change a prediction.
+**First: units.** Horizontal iris offset swings about +/-0.02 over a whole
+screen, the quadratic terms about 1e-3, head distance sits near 35. One flat
+lambda barely touched the big columns and shrank the small ones to nothing. The
+fit came out accurate horizontally and flat vertically — "vertical gaze
+tracking does not work".
+
+**Second: origin.** Dividing by RMS fixed the units and left a subtler version
+standing, hidden behind the fix for the first. What a penalty actually costs a
+column is its ability to explain VARIATION, which is its standard deviation,
+not its RMS — and those are only the same number for a zero-mean column. Every
+head-POSITION feature is offset: `faceX` sits near 0.5 and moves by 0.03,
+`span` sits near 0.22 and moves by 0.003.
+
+Measured on the real design, std/RMS was **0.069 for faceX, 0.065 for faceY and
+0.015 for span** — penalised 14x, 15x and 67x harder than `gx` for no reason
+but where their zero happens to sit. span's fitted contribution came to 0.0002.
+They were switched off, and they are exactly the features that notice you
+sliding your head sideways, which is what a hand-held phone does constantly.
+Fixing it took a pure-slide test case from 13.7% of the screen to 3.8%.
+
+`tests/solve.mjs` pins both invariances: rescaling a column must not change a
+prediction, and **offsetting** a column must not either. Note what a check
+would still pass with if it only asked whether the fit works: everything.
+
+A bonus from centring: a column that never varies becomes exactly zero and
+drops out with a zero coefficient, instead of being a second intercept that
+splits a coefficient with the first.
 
 ## Conventions
 
