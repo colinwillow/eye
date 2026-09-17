@@ -1,7 +1,7 @@
 import { Tracker, BlinkDetector } from './tracker.js';
-import { extract, rawMapping } from './features.js';
+import { extract, rawMapping, FEATURE_SETS } from './features.js';
 import { OneEuro2D } from './filter.js';
-import { Calibration, predict, saveModel, loadModel, clearModel } from './calibrate.js';
+import { Calibration, predict, saveCalibration, loadCalibration, clearCalibration } from './calibrate.js';
 import { coverMap, sizeCanvas, drawFace, drawGaze, drawCalDot } from './draw.js';
 
 const TUNING = {
@@ -24,6 +24,10 @@ const TUNING = {
   paintFade: 0.006,   // per frame; a slow bleach so a drawing lasts but not forever
 };
 
+// state.models[state.active], or null. Everything downstream asks for this
+// rather than reaching into the map, so flipping the active set is one write.
+const activeModel = () => state.models[state.active] || null;
+
 const $ = id => document.getElementById(id);
 const el = {
   cam: $('cam'), wrap: $('camwrap'), overlay: $('overlay'), stage: $('stage'), paint: $('paint'),
@@ -37,9 +41,16 @@ const state = {
   tracker: new Tracker(),
   blink: new BlinkDetector(),
   filter: new OneEuro2D(TUNING.smooth),
-  model: null,
-  modelMeta: null,
+  // Two models fitted from one calibration, and a button that flips between
+  // them. Keeping both is the point: the only way to answer "is head-pose
+  // compensation actually better" on a real face is to switch between them
+  // mid-session without recalibrating in between.
+  models: {},
+  meta: {},
+  active: 'flat',
   cal: null,
+  shownPass: 0,
+  calHoldUntil: 0,
   rest: null,         // uncalibrated origin — where "straight ahead" is
   gaze: null,         // last smoothed point, 0..1 screen space
   trail: [],
@@ -74,8 +85,8 @@ async function boot() {
 
     await state.tracker.load(status);
 
-    const saved = loadModel();
-    if (saved) { state.model = saved.model; state.modelMeta = saved.meta; }
+    const saved = loadCalibration();
+    if (saved) { state.models = saved.models; state.meta = saved.meta || {}; state.active = saved.active; }
 
     el.boot.classList.add('gone');
     keepAwake();
@@ -128,7 +139,10 @@ function loop(now) {
   if (state.tracker.lastVideoTime !== before) state.detCount++;
 
   const lm = state.tracker.landmarks;
-  const f = lm ? extract(lm) : null;
+  // The transformation matrix is a real 3D head pose solved against MediaPipe's
+  // canonical face model. It was already being requested and then dropped on
+  // the floor; the `pose` feature set is what finally reads it.
+  const f = lm ? extract(lm, state.tracker.result?.facialTransformationMatrixes?.[0]) : null;
   if (f?.ok) state.faceSeen = now;
 
   // Blink. While the eyes are shut the iris centre is being inferred from an
@@ -138,7 +152,7 @@ function loop(now) {
   state.blinking = score != null ? score > 0.5 : (f?.ok && f.ear != null ? f.ear < 0.14 : false);
   if (state.blink.update(score, now) === 'click') onBlinkClick();
 
-  if (state.cal) runCalibration(dt, f);
+  if (state.cal) runCalibration(dt, f, now);
   else if (f?.ok && !state.blinking) updateGaze(f, dt);
 
   render(dt, lm, f);
@@ -159,7 +173,15 @@ function updateGaze(f, dt) {
   // screen re-takes it.
   if (!state.rest) state.rest = { gx: f.gx, gy: f.gy, hx: f.hx, hy: f.hy };
 
-  const raw = state.model ? predict(state.model, f) : rawMapping(f, state.rest);
+  // A pose model with no matrix this frame has nothing to predict from. Fall
+  // back to the flat model rather than to the raw mapping: the flat one is a
+  // real calibration and the raw one is a guess, and silently swapping a
+  // calibrated estimate for a guess is a jump the user cannot account for.
+  const m = activeModel();
+  const set = m && FEATURE_SETS[m.set];
+  const usableNow = m && (!set.needsPose || f.pose);
+  const model = usableNow ? m : (state.models.flat || null);
+  const raw = model ? predict(model, f) : rawMapping(f, state.rest);
   const o = TUNING.overshoot;
   const p = state.filter.filter({
     x: Math.min(1 + o, Math.max(-o, raw.x)),
@@ -177,31 +199,65 @@ function startCalibration() {
   setMode('gaze');
   document.body.classList.add('calibrating');
   state.calStarting = true;
-  el.calintro.classList.add('show');
+  state.shownPass = 1;
+  showCalCard(1);
   setTimeout(() => {
     el.calintro.classList.remove('show');
     state.calStarting = false;
     state.cal = new Calibration();
-  }, 1500);
+  }, 1800);
 }
 
-function runCalibration(dt, f) {
+function runCalibration(dt, f, now) {
+  // The second pass asks for something different (keep looking at the dot,
+  // move your head) and looks identical. Announce it and hold, or it gets done
+  // as another still pass and the head terms end up as dead as they were.
+  if (state.cal.pass !== state.shownPass) {
+    state.shownPass = state.cal.pass;
+    state.calHoldUntil = now + 2100;
+    showCalCard(state.cal.pass);
+  }
+  if (now < state.calHoldUntil) return;
+  el.calintro.classList.remove('show');
+
   const running = state.cal.step(dt, f);
   if (running) return;
 
   const r = state.cal.result;
   state.cal = null;
   document.body.classList.remove('calibrating');
-  if (r?.ok) {
-    state.model = r.model;
-    state.modelMeta = { rmse: r.rmse.mean, samples: r.samples, at: Date.now() };
-    saveModel(r.model, state.modelMeta);
-    state.filter.reset();
-    note(`calibrated · residual ${(r.rmse.mean * 100).toFixed(1)}% of screen · ${r.samples} samples`);
-    setMode('gaze');
-  } else {
-    note(`calibration failed (${r?.reason || 'no samples'}) — keep your face in frame and try again`, true);
+
+  const fitted = Object.entries(r).filter(([, v]) => v.ok);
+  if (!fitted.length) {
+    const why = Object.values(r)[0]?.reason || 'no samples';
+    note(`calibration failed (${why}) — keep your face in frame and try again`, true);
+    return;
   }
+
+  state.models = {}; state.meta = {};
+  for (const [set, v] of fitted) {
+    state.models[set] = v.model;
+    state.meta[set] = { rmse: v.rmse.mean, samples: v.samples };
+  }
+  // Land on the head-aware one when it fitted, since it is the one that was
+  // just paid for with an extra pass. The button flips straight back.
+  state.active = state.models.pose ? 'pose' : 'flat';
+  saveCalibration({ models: state.models, meta: state.meta, active: state.active });
+  state.filter.reset();
+
+  const line = fitted.map(([set, v]) => `${set} ${(v.rmse.mean * 100).toFixed(1)}%`).join(' · ');
+  note(`calibrated — ${line} · tap "model" to compare`);
+  if (!r.pose?.ok) note(`calibrated (${(r.flat.rmse.mean * 100).toFixed(1)}%) — no head pose from the mesh, so the pose model was skipped`, true);
+  setMode('gaze');
+}
+
+function showCalCard(pass) {
+  el.calintro.innerHTML = pass === 2
+    ? '<div>keep looking at the dot<br>and <b>slowly move your head</b></div>' +
+      '<small>four dots · small circles, lean a little · this is what teaches it to ignore your head</small>'
+    : '<div>look at each dot<br>until it fills</div>' +
+      '<small>nine dots · hold still</small>';
+  el.calintro.classList.add('show');
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
@@ -242,11 +298,11 @@ function render(dt, lm, f) {
 
   if (state.cal) {
     const p = state.cal.point;
-    drawCalDot(ctx, { x: p.x * w, y: p.y * h }, state.cal.phase, state.cal.phaseT);
+    drawCalDot(ctx, { x: p.x * w, y: p.y * h }, state.cal.phase, state.cal.phaseT, state.cal.pass);
   } else if (state.mode !== 'face' && state.gaze) {
     drawGaze(ctx, { x: state.gaze.x * w, y: state.gaze.y * h }, {
       w, h,
-      confident: !!state.model,
+      confident: !!activeModel(),
       blink: state.blinking,
       trail: state.mode === 'paint' ? [] : state.trail.map(t => ({ x: t.x * w, y: t.y * h })),
     });
@@ -263,15 +319,30 @@ function render(dt, lm, f) {
   }
 }
 
+const deg = r => (r * 180 / Math.PI).toFixed(0).padStart(3);
+
 function updateHud(f, now) {
   const live = now - state.faceSeen < 400;
-  const cal = state.model
-    ? `calibrated ${state.modelMeta?.rmse != null ? '±' + (state.modelMeta.rmse * 100).toFixed(1) + '%' : ''}`
+  const m = activeModel();
+  const cal = m
+    ? `${m.set}${state.meta[m.set]?.rmse != null ? ' ±' + (state.meta[m.set].rmse * 100).toFixed(1) + '%' : ''}`
     : 'UNCALIBRATED';
+  const other = Object.keys(state.models).filter(k => k !== state.active)
+    .map(k => `${k} ${(state.meta[k]?.rmse * 100).toFixed(1)}%`).join(' ');
+
+  // Head pose is printed raw and in degrees because it is the one thing here
+  // that cannot be checked without a face in front of the camera: turn your
+  // head and watch whether yaw moves the way you would expect, and whether
+  // dist matches a tape measure.
+  const pose = f?.ok && f.pose
+    ? `yaw${deg(f.pose.yaw)} pit${deg(f.pose.pitch)} rol${deg(f.pose.roll)} d${f.pose.dist.toFixed(1)}`
+    : '<span class="warn">no head pose</span>';
+
   el.hud.innerHTML = [
     `${live ? 'face' : '<b class="warn">no face</b>'} · ${state.tracker.delegate || '—'} · ${state.detFps.toFixed(0)}/${state.fps.toFixed(0)} fps`,
-    `<span class="${state.model ? '' : 'warn'}">${cal}</span>${state.blinking ? ' · <b>blink</b>' : ''}`,
-    f?.ok ? `gx ${f.gx.toFixed(3)}  gy ${f.gy.toFixed(3)}  hx ${f.hx.toFixed(3)}` : (f?.reason ? `— ${f.reason}` : '—'),
+    `<span class="${m ? '' : 'warn'}">${cal}</span>${other ? ` <span class="dim">(${other})</span>` : ''}${state.blinking ? ' · <b>blink</b>' : ''}`,
+    f?.ok ? `gx ${f.gx.toFixed(3)} gy ${f.gy.toFixed(3)} asy ${f.asym.toFixed(3)}` : (f?.reason ? `— ${f.reason}` : '—'),
+    pose,
   ].join('<br>');
 }
 
@@ -310,8 +381,17 @@ el.bar.addEventListener('click', e => {
       state.mesh = !state.mesh;
       b.classList.toggle('on', state.mesh);
       break;
+    case 'model': {
+      const sets = Object.keys(state.models);
+      if (sets.length < 2) { note(sets.length ? 'only one model fitted — recalibrate to get both' : 'calibrate first'); break; }
+      state.active = sets[(sets.indexOf(state.active) + 1) % sets.length];
+      saveCalibration({ models: state.models, meta: state.meta, active: state.active });
+      state.filter.reset();
+      note(`${state.active} — ${state.active === 'pose' ? 'head pose compensated' : 'the original, eyes only'}`);
+      break;
+    }
     case 'reset':
-      clearModel(); state.model = null; state.modelMeta = null; state.rest = null; state.filter.reset();
+      clearCalibration(); state.models = {}; state.meta = {}; state.rest = null; state.filter.reset();
       note('calibration cleared');
       break;
     case 'clear': {
@@ -327,7 +407,7 @@ el.bar.addEventListener('click', e => {
 // middle of the screen and tap, and the dot is centred again. Useless once
 // calibrated, which is why it only says so then.
 el.wrap.addEventListener('pointerdown', () => {
-  if (state.model) return note('already calibrated — reset first if you want the rough mode back');
+  if (activeModel()) return note('already calibrated — reset first if you want the rough mode back');
   state.rest = null; state.filter.reset();
   note('re-centred');
 });

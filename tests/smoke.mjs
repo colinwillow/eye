@@ -126,17 +126,36 @@ try {
   // the opposite of the raw mapping's assumption, so a fit that quietly leaned
   // on that assumption would come out mirrored here.
   await page.evaluate(`(async () => {
-    const { makeFace } = await import('/tests/harness.mjs');
-    window.__face = (sx, sy) => {
-      const u = sx - 0.5, v = sy - 0.5;
-      return makeFace({ gx: -(0.090 * u + 0.020 * u * v), gy: 0.055 * v + 0.012 * u * v });
+    const { makeFace, makeMatrix } = await import('/tests/harness.mjs');
+    // Head pose follows the calibration's own pass: still through pass 1, a
+    // slow wander through pass 2. That is what the second pass asks a person
+    // to do, and without it the pose model has no head variation to fit and
+    // the whole comparison below measures nothing.
+    window.__head = { yaw: 0, pitch: 0, tx: 0, ty: 0 };
+    window.__face = (sx, sy, h) => {
+      const D = 5.5, SW = 1.2, SH = 2.5, K = 0.115, SCALE = 0.22;
+      const ax = Math.atan2((sx - 0.5) * SW - h.tx, D);
+      const ay = Math.atan2((sy - 0.5) * SH - h.ty, D);
+      return makeFace({
+        gx: -K * Math.sin(ax - h.yaw), gy: K * Math.sin(ay - h.pitch),
+        yaw: h.yaw, pitch: h.pitch,
+        cx: 0.5 + h.tx * SCALE, cy: 0.42 + h.ty * SCALE,
+      });
     };
     window.__target = { x: 0.5, y: 0.5 };
+    let t = 0;
     const tr = __eye.state.tracker;
     tr.detect = function () {
-      const p = __eye.state.cal ? __eye.state.cal.point : window.__target;
+      t += 1 / 30;
+      const cal = __eye.state.cal;
+      const p = cal ? cal.point : window.__target;
+      const h = (cal && cal.pass === 2)
+        ? { yaw: 0.30 * Math.sin(t * 1.7), pitch: 0.18 * Math.sin(t * 1.1 + 2),
+            tx: 0.30 * Math.sin(t * 0.9 + 1), ty: 0.22 * Math.sin(t * 1.4 + 0.5) }
+        : window.__head;
       this.result = {
-        faceLandmarks: [window.__face(p.x, p.y)],
+        faceLandmarks: [window.__face(p.x, p.y, h)],
+        facialTransformationMatrixes: [makeMatrix({ yaw: h.yaw, pitch: h.pitch, dist: 35 })],
         faceBlendshapes: [{ categories: [
           { categoryName: 'eyeBlinkLeft', score: 0.02 }, { categoryName: 'eyeBlinkRight', score: 0.02 } ] }],
       };
@@ -146,7 +165,12 @@ try {
   })()`);
 
   await sleep(600);
-  check('a stubbed face is picked up', /(^|\\s)face/.test(await page.locator('#hud').textContent()));
+  const hud = await page.locator('#hud').textContent();
+  check('a stubbed face is picked up', /(^|\\s)face/.test(hud));
+  // The matrix has to survive the trip from the detector into the features,
+  // because the pose model is built entirely on it and a missing one is not an
+  // error — it is a silent fall back to the flat model.
+  check('head pose reaches the HUD', /yaw/.test(hud) && !/no head pose/.test(hud), hud);
 
   // The overlay has to actually put ink on the canvas. This is the cheapest
   // check that coverMap did not send every landmark off the edge of the box.
@@ -179,16 +203,39 @@ try {
   check('so is the bar', clear.bar === false);
   check('so is the camera preview', clear.cam === false);
 
-  await page.waitForFunction('window.__eye.state.model && !window.__eye.state.cal', null, { timeout: 45000 });
-  const meta = await page.evaluate('({ rmse: __eye.state.modelMeta.rmse, samples: __eye.state.modelMeta.samples })');
-  check('the calibration produced a model', meta.samples > 100, JSON.stringify(meta));
-  check('the residual is small', meta.rmse < 0.03, String(meta.rmse));
-  check('it survives into localStorage', await page.evaluate(`!!localStorage.getItem('eye.calibration.v2')`));
+  // Two passes now: nine still dots, then four with the head moving, with an
+  // announcement card before each.
+  // Wait on the CARD, not on the state machine reaching pass 2. The card is
+  // raised by the render loop on the frame after the pass changes, so waiting
+  // on the state and then asserting the card is a one-frame race that passes
+  // on a fast machine and fails on a slow one.
+  await page.waitForFunction(
+    `window.__eye.state.cal && window.__eye.state.cal.pass === 2 &&
+     document.querySelector('#calintro.show')`, null, { timeout: 60000 });
+  check('the head pass announces itself', await page.locator('#calintro.show').count() === 1);
+  check('  and says what is different about it',
+    /move your head/i.test(await page.locator('#calintro').textContent()));
+
+  await page.waitForFunction('!window.__eye.state.cal && Object.keys(window.__eye.state.models).length', null, { timeout: 90000 });
+  const fitted = await page.evaluate('({ sets: Object.keys(__eye.state.models), active: __eye.state.active, meta: __eye.state.meta })');
+  check('both models are fitted from the one calibration',
+    fitted.sets.includes('flat') && fitted.sets.includes('pose'), JSON.stringify(fitted.sets));
+  check('it lands on the head-aware one', fitted.active === 'pose', fitted.active);
+  check('both have a residual', fitted.meta.flat?.rmse < 0.05 && fitted.meta.pose?.rmse < 0.05, JSON.stringify(fitted.meta));
+  check('it survives into localStorage', await page.evaluate(`!!localStorage.getItem('eye.calibration.v3')`));
+
+  // The toggle is the entire reason both models are kept.
+  await page.click('[data-act="model"]');
+  check('the model button flips the active set', await page.evaluate('__eye.state.active') === 'flat');
+  check('  and the HUD says which is live', /flat/.test(await page.locator('#hud').textContent()));
+  await page.click('[data-act="model"]');
+  check('  and flips back', await page.evaluate('__eye.state.active') === 'pose');
 
   // ── and the dot goes where it is looking ──────────────────────────────────
   // Direction, not distance. A mirrored model would satisfy any check that only
   // asked whether the dot moved.
-  const look = async (x, y) => {
+  const look = async (x, y, head = null) => {
+    if (head) await page.evaluate(`window.__head = ${JSON.stringify(head)}`);
     await page.evaluate(`window.__target = { x: ${x}, y: ${y} }`);
     await sleep(1400);                       // let One Euro settle
     return page.evaluate('({ ...__eye.state.gaze })');
@@ -200,14 +247,26 @@ try {
   check('looking up puts the dot up', U.y < 0.35, `y = ${U.y?.toFixed(3)}`);
   check('looking down puts the dot down', D.y > 0.65, `y = ${D.y?.toFixed(3)}`);
 
+  // The same four, with the head turned and shifted. This is the claim the
+  // second calibration pass exists to support, checked end to end in a browser
+  // rather than only against the maths.
+  const turned = { yaw: 0.22, pitch: 0.12, tx: 0.18, ty: 0.12 };
+  const TL = await look(0.15, 0.5, turned), TR = await look(0.85, 0.5, turned);
+  const TU = await look(0.5, 0.15, turned), TD = await look(0.5, 0.85, turned);
+  check('with the head turned, left is still left', TL.x < 0.4, `x = ${TL.x?.toFixed(3)}`);
+  check('with the head turned, right is still right', TR.x > 0.6, `x = ${TR.x?.toFixed(3)}`);
+  check('with the head turned, up is still up', TU.y < 0.4, `y = ${TU.y?.toFixed(3)}`);
+  check('with the head turned, down is still down', TD.y > 0.6, `y = ${TD.y?.toFixed(3)}`);
+  await page.evaluate(`window.__head = { yaw: 0, pitch: 0, tx: 0, ty: 0 }`);
+
   // ── modes ─────────────────────────────────────────────────────────────────
   for (const m of ['face', 'paint', 'gaze']) {
     await page.click(`[data-mode="${m}"]`);
     check(`the ${m} button selects ${m} mode`, await page.evaluate('document.body.dataset.mode') === m);
   }
   await page.click('[data-act="reset"]');
-  check('reset clears the calibration', await page.evaluate('!__eye.state.model'));
-  check('  and forgets it on disk too', await page.evaluate(`!localStorage.getItem('eye.calibration.v2')`));
+  check('reset clears the calibration', await page.evaluate('!Object.keys(__eye.state.models).length'));
+  check('  and forgets it on disk too', await page.evaluate(`!localStorage.getItem('eye.calibration.v3')`));
 
   check('no uncaught errors anywhere in that', errors.length === 0, errors.slice(0, 3).join(' | '));
 } catch (e) {

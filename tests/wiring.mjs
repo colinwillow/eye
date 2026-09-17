@@ -34,6 +34,13 @@ for (const a of actsHandled) check(`the "${a}" handler has a button`, actsInHtml
 for (const m of modesInCss) check(`the CSS mode "${m}" is a real mode`, modesInHtml.includes(m));
 
 check('there are three modes', modesInHtml.length === 3, modesInHtml.join(','));
+check('the model toggle is on the bar', actsInHtml.includes('model'));
+
+// The head pass asks for something different and looks identical. If nothing
+// announces it, it gets done as another still pass and every head term ends
+// up as dead as it was before the pass existed.
+check('main.js announces the calibration pass', /showCalCard\(/.test(main));
+check('  and the dot is drawn with its pass', /drawCalDot\([^)]*state\.cal\.pass/.test(main));
 check('face is the default mode in the markup', /<body[^>]*data-mode="face"/.test(html));
 
 // ── module graph ────────────────────────────────────────────────────────────

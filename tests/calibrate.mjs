@@ -1,148 +1,316 @@
-import { Calibration, calPoints, fit, predict, CAL } from '../src/calibrate.js';
-import { extract, designRow } from '../src/features.js';
-import { check, near, report, makeFace } from './harness.mjs';
+import { Calibration, calPoints, fit, fitAll, predict, CAL, MODEL_VERSION,
+         saveCalibration, loadCalibration, clearCalibration } from '../src/calibrate.js';
+import { extract, designRow, FEATURE_TERMS } from '../src/features.js';
+import { check, near, report, makeFace, makeMatrix } from './harness.mjs';
 
 // Deterministic noise. A flaky accuracy check is worse than no accuracy check:
 // it gets re-run until it passes and then nobody trusts it.
 let seed = 12345;
 const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
 const noise = a => (rnd() - 0.5) * 2 * a;
+const reseed = s => { seed = s; };
 
-// ── A synthetic eyeball ─────────────────────────────────────────────────────
-// Given a point on the screen, what would the iris offsets look like? Roughly
-// linear, because the angles a phone subtends are small, plus a deliberate
-// quadratic and a cross term so the second-order fit has something real to do.
+// ── A synthetic head that obeys the actual geometry ─────────────────────────
+// The eye has to POINT at the target, so what the iris does depends on where
+// the head is and which way it is facing:
 //
-// `flip` inverts the horizontal convention. That is the point of it: the fit
-// must come out right EITHER WAY, because the one thing this design refuses to
-// do is assume which way a positive iris offset points.
-function eyeball(sx, sy, { flip = false, jitter = 0.0015 } = {}) {
-  const u = sx - 0.5, v = sy - 0.5;
-  const gx = (flip ? 1 : -1) * (0.090 * u + 0.020 * u * v + 0.015 * u * Math.abs(u)) + noise(jitter);
-  const gy = 0.055 * v + 0.010 * v * v + 0.012 * u * v + noise(jitter);
-  return extract(makeFace({ gx, gy, hx: noise(0.004) }));
+//   the angle from the eye to the target, in the world  =  head yaw
+//                                                       +  eye rotation in the head
+//
+// and only that last term is what the iris offset measures. Rearranged, the
+// screen position is  D * tan(yaw + eyeAngle), and the tangent of a sum is
+// where the whole difficulty lives: expand it and the eye's contribution is
+// multiplied by (1 + tan^2 yaw). A turned head does not shift the mapping, it
+// RESCALES it — the same iris offset means a different distance across the
+// screen depending on where your head is pointing. A model with head terms but
+// no cross terms can only shift.
+//
+// Head TRANSLATION is separate and simpler: move sideways without turning and
+// every target is at a new angle, while every rotation feature reads the same.
+const D = 5.5;          // eye to screen, in inter-ocular units (~35cm)
+const SW = 1.2, SH = 2.5;   // phone screen, same units (~7.5 x 15cm)
+const K = 0.115;        // iris offset per unit sine of eye rotation
+const SCALE = 0.22;     // projection scale, matching makeFace's default
+
+function look(sx, sy, head = {}, { flip = false, jitter = 0.0015 } = {}) {
+  const { yaw = 0, pitch = 0, tx = 0, ty = 0 } = head;
+  const ax = Math.atan2((sx - 0.5) * SW - tx, D);
+  const ay = Math.atan2((sy - 0.5) * SH - ty, D);
+  const gx = (flip ? 1 : -1) * K * Math.sin(ax - yaw) + noise(jitter);
+  const gy = K * Math.sin(ay - pitch) + noise(jitter);
+  return extract(
+    makeFace({ gx, gy, yaw, pitch, cx: 0.5 + tx * SCALE, cy: 0.42 + ty * SCALE }),
+    makeMatrix({ yaw, pitch, dist: 35 }));
 }
+
+// What a person actually does when told to move their head a little: a slow
+// wander, not a sweep to the extremes.
+const wander = t => ({
+  yaw: 0.30 * Math.sin(t * 1.7),
+  pitch: 0.18 * Math.sin(t * 1.1 + 2),
+  tx: 0.30 * Math.sin(t * 0.9 + 1),
+  ty: 0.22 * Math.sin(t * 1.4 + 0.5),
+});
 
 // ── the dot grid ────────────────────────────────────────────────────────────
 {
   const p = calPoints();
-  check('nine calibration points', p.length === 9);
+  check('nine still points', p.length === 9);
   check('the first one is the centre', Math.abs(p[0].x - 0.5) < 1e-9 && Math.abs(p[0].y - 0.5) < 1e-9);
   check('all inside the inset', p.every(q => q.x >= CAL.inset - 1e-9 && q.x <= 1 - CAL.inset + 1e-9 &&
                                              q.y >= CAL.inset - 1e-9 && q.y <= 1 - CAL.inset + 1e-9));
   check('they are all distinct', new Set(p.map(q => `${q.x},${q.y}`)).size === 9);
   check('the grid spans both axes', new Set(p.map(q => q.x.toFixed(4))).size === 3 &&
                                     new Set(p.map(q => q.y.toFixed(4))).size === 3);
+
+  const cal = new Calibration();
+  check('the head pass is appended, not mixed in', cal.points.slice(0, 9).every(q => q.pass === 1) &&
+                                                   cal.points.slice(9).every(q => q.pass === 2));
+  check('the head pass is four corners', cal.points.filter(q => q.pass === 2).length === 4);
 }
 
-// ── the sequence runs and produces a model ──────────────────────────────────
-function runSequence(opts = {}) {
+// ── running the sequence ────────────────────────────────────────────────────
+// `moveHead` is what the second pass asks of the person. Being able to turn it
+// OFF is what lets the pairing check below exist at all.
+function runSequence({ moveHead = true, still = false, blind = false, flip = false } = {}) {
+  reseed(999);
   const cal = new Calibration();
   const dt = 1 / 30;
-  let guard = 0;
-  while (cal.step(dt, opts.blind ? null : eyeball(cal.point.x, cal.point.y, opts)) && guard++ < 10000);
+  let t = 0, guard = 0;
+  for (;;) {
+    t += dt;
+    const head = (!still && moveHead && cal.pass === 2) ? wander(t) : {};
+    const f = blind ? null : look(cal.point.x, cal.point.y, head, { flip });
+    if (!cal.step(dt, f) || guard++ > 20000) break;
+  }
   return cal;
 }
 
 {
   const cal = runSequence();
   check('the sequence finishes', cal.done);
-  check('it produced a model', cal.result?.ok, cal.result?.reason);
-  check('it collected a sensible number of samples', cal.result.samples > 150 && cal.result.samples < 400,
-    String(cal.result.samples));
-  check('the design row width matches the model', cal.result.model.W.length === designRow({ gx: 0, gy: 0, hx: 0, hy: 0 }, 2).length);
-  check('the training residual is small', cal.result.rmse.mean < 0.02, String(cal.result.rmse.mean));
+  check('the flat model fits', cal.result.flat.ok, cal.result.flat.reason);
+  check('the pose model fits', cal.result.pose.ok, cal.result.pose.reason);
+  check('flat is fitted from the still pass only',
+    cal.result.flat.samples < cal.result.pose.samples,
+    `${cal.result.flat.samples} vs ${cal.result.pose.samples}`);
+  check('the model carries its feature set', cal.result.pose.model?.set === 'pose');
+  check('  and its width matches that set', cal.result.pose.model?.W.length === FEATURE_TERMS.pose);
+  check('  and a version', cal.result.pose.model?.version === MODEL_VERSION);
+
+  // A fit that drops every sample reports "too-few-samples" from a run that
+  // collected hundreds, which reads as a refusal rather than a bug. Compare
+  // what was kept against what was collected.
+  check('the fits actually used the samples they were given',
+    cal.result.pose.samples > cal.samples.length * 0.9,
+    `kept ${cal.result.pose.samples} of ${cal.samples.length}`);
 }
 
-// ── ACCURACY, on points it was never shown ──────────────────────────────────
-// The residual a fit reports on its own training data is the optimistic
-// number and it always looks good. This measures a fresh grid, deliberately
-// offset from the calibration dots.
-{
-  const model = runSequence().result.model;
-  let worst = 0, sum = 0, n = 0;
-  for (let i = 0; i < 5; i++) for (let j = 0; j < 5; j++) {
-    const sx = 0.14 + i * 0.18, sy = 0.14 + j * 0.18;
-    const p = predict(model, eyeball(sx, sy));
+// ── ACCURACY WITH A STILL HEAD ──────────────────────────────────────────────
+// The baseline case. The new model must not be WORSE here — extra terms fitted
+// to a calibration that never exercised them is exactly how a "smarter" model
+// ends up worse than the one it replaced.
+function evaluate(model, { heads, n = 240 }) {
+  reseed(4242);
+  let sum = 0, worst = 0;
+  for (let i = 0; i < n; i++) {
+    const sx = 0.08 + rnd() * 0.84, sy = 0.08 + rnd() * 0.84;
+    const p = predict(model, look(sx, sy, heads()));
     const e = Math.hypot(p.x - sx, p.y - sy);
-    worst = Math.max(worst, e); sum += e; n++;
+    sum += e; worst = Math.max(worst, e);
   }
-  check('mean error on unseen points is under 3% of the screen', sum / n < 0.03, `${(sum / n * 100).toFixed(2)}%`);
-  check('worst-case error is under 6%', worst < 0.06, `${(worst * 100).toFixed(2)}%`);
+  return { mean: sum / n, worst };
+}
+
+const trained = runSequence();
+const STILL = () => ({});
+const MOVING = () => ({
+  yaw: (rnd() - 0.5) * 0.6, pitch: (rnd() - 0.5) * 0.4,
+  tx: (rnd() - 0.5) * 0.6, ty: (rnd() - 0.5) * 0.5,
+});
+
+{
+  const flat = evaluate(trained.result.flat.model, { heads: STILL });
+  const pose = evaluate(trained.result.pose.model, { heads: STILL });
+  check('flat is accurate with a still head', flat.mean < 0.045, `${(flat.mean * 100).toFixed(2)}%`);
+  check('pose is accurate with a still head', pose.mean < 0.045, `${(pose.mean * 100).toFixed(2)}%`);
+  check('pose does not regress the still case', pose.mean < flat.mean * 1.15,
+    `pose ${(pose.mean * 100).toFixed(2)}% vs flat ${(flat.mean * 100).toFixed(2)}%`);
+
+  // The pose model's TRAINING residual is the worse of the two, because it is
+  // fitted to a harder dataset — nine still dots plus four with the head
+  // wandering. Reading that as "flat is the better model" is the trap: a
+  // residual measured on a calibration where the head never moved is a score
+  // for a test that left out the thing being tested.
+  check('the residual on its own calibration flatters the flat model',
+    trained.result.flat.rmse.mean < trained.result.pose.rmse.mean,
+    `flat ${trained.result.flat.rmse.mean.toFixed(4)} vs pose ${trained.result.pose.rmse.mean.toFixed(4)}`);
+}
+
+// ── THE WHOLE POINT: A HEAD THAT MOVES ──────────────────────────────────────
+// A phone at arm's length subtends about 12 degrees. A head turn of 17 — which
+// is nothing, it is glancing at someone next to you — swings the point your
+// eyes have to aim at by MORE THAN A SCREEN WIDTH. That is the whole reason
+// propping the phone against something transforms this: not that the tracker
+// needs a still head, but that a small head movement is enormous compared to
+// the thing being measured, and the flat model has no way to see it.
+{
+  const gentle = () => ({ yaw: (rnd() - 0.5) * 0.24, pitch: (rnd() - 0.5) * 0.18,
+                          tx: (rnd() - 0.5) * 0.24, ty: (rnd() - 0.5) * 0.2 });
+  const flatG = evaluate(trained.result.flat.model, { heads: gentle });
+  const poseG = evaluate(trained.result.pose.model, { heads: gentle });
+  check('even a small head movement wrecks the flat model', flatG.mean > 0.15,
+    `${(flatG.mean * 100).toFixed(1)}% — if this ever fails, the rig stopped moving the head`);
+  check('the pose model shrugs off a small head movement', poseG.mean < 0.05,
+    `${(poseG.mean * 100).toFixed(2)}%`);
+
+  const flat = evaluate(trained.result.flat.model, { heads: MOVING });
+  const pose = evaluate(trained.result.pose.model, { heads: MOVING });
+  check('a freely moving head leaves the flat model useless', flat.mean > 0.2,
+    `${(flat.mean * 100).toFixed(1)}%`);
+  check('the pose model survives a freely moving head', pose.mean < 0.08, `${(pose.mean * 100).toFixed(2)}%`);
+  check('pose beats flat by at least 4x with a moving head',
+    pose.mean * 4 < flat.mean,
+    `pose ${(pose.mean * 100).toFixed(2)}% vs flat ${(flat.mean * 100).toFixed(2)}%`);
+  check('and the worst case improves too', pose.worst < flat.worst,
+    `${(pose.worst * 100).toFixed(2)}% vs ${(flat.worst * 100).toFixed(2)}%`);
+}
+
+// ── THE TWO HALVES ONLY WORK AS A PAIR ──────────────────────────────────────
+// The features and the head-movement pass were added together, and neither is
+// worth anything alone. This is the check that says so, and it is the reason
+// calibration got longer rather than just the feature list getting richer.
+//
+// Fit the SAME pose feature set from a calibration where the head never moved:
+// every head term and every cross term is a column with no variation for the
+// data to attribute anything to, ridge shrinks them toward zero, and the model
+// comes back barely better than the flat one it was supposed to beat. Anyone
+// measuring only the feature change would conclude the idea did not work.
+{
+  const stillOnly = runSequence({ still: true });
+  const naive = stillOnly.result.pose.model;
+  const naiveErr = evaluate(naive, { heads: MOVING });
+  const goodErr = evaluate(trained.result.pose.model, { heads: MOVING });
+  const flatErr = evaluate(trained.result.flat.model, { heads: MOVING });
+
+  check('pose features WITHOUT the head pass barely help',
+    naiveErr.mean > flatErr.mean * 0.6,
+    `naive-pose ${(naiveErr.mean * 100).toFixed(2)}% vs flat ${(flatErr.mean * 100).toFixed(2)}%`);
+  check('pose features WITH the head pass are transformative',
+    goodErr.mean < naiveErr.mean * 0.5,
+    `with ${(goodErr.mean * 100).toFixed(2)}% vs without ${(naiveErr.mean * 100).toFixed(2)}%`);
 }
 
 // ── DIRECTION, after calibration ────────────────────────────────────────────
-// Same reasoning as the feature suite: an accuracy number is a distance, and
-// a distance is exactly what a mirrored model would also satisfy if the test
-// grid were symmetric. These pin the sides.
-{
-  const model = runSequence().result.model;
-  const at = (x, y) => predict(model, eyeball(x, y));
-  check('the left of the screen predicts left', at(0.15, 0.5).x < 0.3, String(at(0.15, 0.5).x));
-  check('the right of the screen predicts right', at(0.85, 0.5).x > 0.7, String(at(0.85, 0.5).x));
-  check('the top of the screen predicts up', at(0.5, 0.15).y < 0.3, String(at(0.5, 0.15).y));
-  check('the bottom of the screen predicts down', at(0.5, 0.85).y > 0.7, String(at(0.5, 0.85).y));
-  check('the corners do not swap axes', at(0.15, 0.85).x < 0.35 && at(0.15, 0.85).y > 0.65);
+// An accuracy number is a distance, and a mirrored model satisfies every
+// distance a symmetric test grid can produce. These pin the sides, for both
+// models, with the head both still and turned.
+for (const set of ['flat', 'pose']) {
+  const model = trained.result[set].model;
+  for (const [name, head] of [['still', {}], ['turned', { yaw: 0.25, tx: 0.2 }]]) {
+    const at = (x, y) => predict(model, look(x, y, head));
+    const skip = set === 'flat' && name === 'turned';   // flat is not expected to hold up
+    if (skip) continue;
+    check(`${set}/${name}: the left of the screen predicts left`, at(0.15, 0.5).x < 0.35, String(at(0.15, 0.5).x));
+    check(`${set}/${name}: the right predicts right`, at(0.85, 0.5).x > 0.65, String(at(0.85, 0.5).x));
+    check(`${set}/${name}: the top predicts up`, at(0.5, 0.15).y < 0.35, String(at(0.5, 0.15).y));
+    check(`${set}/${name}: the bottom predicts down`, at(0.5, 0.85).y > 0.65, String(at(0.5, 0.85).y));
+    check(`${set}/${name}: the corners do not swap axes`, at(0.15, 0.85).x < 0.4 && at(0.15, 0.85).y > 0.6);
+  }
 }
 
 // ── HANDEDNESS IS LEARNED, NOT ASSUMED ──────────────────────────────────────
-// Feed the fit an eyeball wired backwards. If calibration were leaning on the
-// raw mapping's sign convention anywhere, this would come out mirrored. It
-// must not — that is the property that makes a wrong guess about the camera's
-// mirroring survivable instead of fatal.
+// Feed the fit an eyeball wired backwards. If anything downstream of the
+// features leaned on the raw mapping's sign convention, this comes out
+// mirrored. It must not — that is the property that makes a wrong guess about
+// the camera's mirroring survivable instead of fatal.
 {
-  const cal = new Calibration();
-  const dt = 1 / 30;
-  let guard = 0;
-  while (cal.step(dt, eyeball(cal.point.x, cal.point.y, { flip: true })) && guard++ < 10000);
-  const model = cal.result.model;
-  const at = (x, y) => predict(model, eyeball(x, y, { flip: true }));
-  check('an inverted eye still calibrates', cal.result.ok);
-  check('  left is still left', at(0.15, 0.5).x < 0.3, String(at(0.15, 0.5).x));
-  check('  right is still right', at(0.85, 0.5).x > 0.7, String(at(0.85, 0.5).x));
-}
-
-// ── second order earns its place ────────────────────────────────────────────
-{
-  const samples = [];
-  for (const p of calPoints()) for (let i = 0; i < 25; i++) {
-    const f = eyeball(p.x, p.y);
-    samples.push({ f: { gx: f.gx, gy: f.gy, hx: f.hx, hy: f.hy }, target: p });
+  const cal = runSequence({ flip: true });
+  for (const set of ['flat', 'pose']) {
+    const at = (x, y) => predict(cal.result[set].model, look(x, y, {}, { flip: true }));
+    check(`${set}: an inverted eye still calibrates`, cal.result[set].ok);
+    check(`${set}: left is still left`, at(0.15, 0.5).x < 0.35, String(at(0.15, 0.5).x));
+    check(`${set}: right is still right`, at(0.85, 0.5).x > 0.65, String(at(0.85, 0.5).x));
   }
-  const o1 = fit(samples, { ...CAL, order: 1 });
-  const o2 = fit(samples, { ...CAL, order: 2 });
-  check('order 1 fits', o1.ok);
-  check('order 2 fits at least as well', o2.rmse.mean <= o1.rmse.mean + 1e-9,
-    `${o2.rmse.mean} vs ${o1.rmse.mean}`);
 }
 
 // ── it fails loudly rather than quietly ─────────────────────────────────────
 {
   const cal = runSequence({ blind: true });
-  check('a calibration with no face at all does not produce a model', !cal.result.ok);
-  check('  and says why', cal.result.reason === 'too-few-samples', cal.result.reason);
+  check('no face at all produces no model', !cal.result.flat.ok && !cal.result.pose.ok);
+  check('  and says why', cal.result.flat.reason === 'too-few-samples', cal.result.flat.reason);
 }
 {
-  // Eyes shut through the whole thing. The landmarks are still there and still
-  // plausible, so nothing throws — the iris is just being inferred from an iris
-  // nobody can see. Dropping on the eye-aspect-ratio is what catches it.
+  // Eyes shut throughout. The landmarks are still there and still plausible,
+  // so nothing throws — the iris is just being inferred from an iris nobody
+  // can see. The eye-aspect-ratio floor is what catches it.
   const cal = new Calibration();
-  const dt = 1 / 30;
   let guard = 0;
-  while (cal.step(dt, extract(makeFace({ ear: 0.05 }))) && guard++ < 10000);
-  check('blinked-through samples are dropped', !cal.result.ok, JSON.stringify(cal.result));
+  while (cal.step(1 / 30, extract(makeFace({ ear: 0.05 }), makeMatrix({}))) && guard++ < 20000);
+  check('blinked-through samples are dropped', !cal.result.flat.ok, JSON.stringify(cal.result.flat));
+}
+{
+  // No transformation matrix at all — an older model, or the option failing.
+  // The flat fit must still work and the pose fit must decline rather than
+  // fitting to a column of NaN.
+  const cal = new Calibration();
+  let guard = 0, t = 0;
+  while (cal.step(1 / 30, look(cal.point.x, cal.point.y, cal.pass === 2 ? wander(t += 1 / 30) : {})
+    && (() => { const f = look(cal.point.x, cal.point.y); f.pose = null; return f; })()) && guard++ < 20000);
+  check('without a matrix the flat model still fits', cal.result.flat.ok, cal.result.flat.reason);
+  check('  and the pose model declines rather than fitting NaN', !cal.result.pose.ok, cal.result.pose.reason);
 }
 
-// ── the model survives a round trip through JSON ────────────────────────────
-// It is stored in localStorage between reloads, and a model that comes back
-// as something predict() quietly returns NaN for is a dot that vanishes on
-// the second visit and works on the first.
+// ── persistence ─────────────────────────────────────────────────────────────
 {
-  const model = runSequence().result.model;
-  const back = JSON.parse(JSON.stringify(model));
-  const a = predict(model, eyeball(0.3, 0.7)), b = predict(back, eyeball(0.3, 0.7));
-  check('a round-tripped model predicts finite numbers', Number.isFinite(b.x) && Number.isFinite(b.y));
-  check('  and predicts the same thing', Math.abs(a.x - b.x) < 0.05 && Math.abs(a.y - b.y) < 0.05);
+  // A minimal localStorage, since this runs in node.
+  const store = new Map();
+  globalThis.localStorage = {
+    getItem: k => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: k => store.delete(k),
+  };
+
+  const models = { flat: trained.result.flat.model, pose: trained.result.pose.model };
+  const meta = { flat: { rmse: 0.01 }, pose: { rmse: 0.008 } };
+  check('it saves', saveCalibration({ models, meta, active: 'pose' }));
+
+  const back = loadCalibration();
+  check('it comes back', !!back);
+  check('  with both models', !!back.models.flat && !!back.models.pose);
+  check('  and the active one', back.active === 'pose');
+  const a = predict(models.pose, look(0.3, 0.7));
+  const b = predict(back.models.pose, look(0.3, 0.7));
+  check('  predicting finite numbers', Number.isFinite(b.x) && Number.isFinite(b.y));
+  check('  predicting the same thing', Math.abs(a.x - b.x) < 0.06 && Math.abs(a.y - b.y) < 0.06);
+
+  // A model whose width does not match the feature set it claims. apply()
+  // would happily multiply what it was given and return a confident wrong
+  // answer rather than throwing, so this has to be caught at load.
+  saveCalibration({ models: { pose: { ...models.pose, W: models.pose.W.slice(0, 4) } }, meta, active: 'pose' });
+  check('a model of the wrong width is rejected', loadCalibration() === null);
+
+  saveCalibration({ models: { flat: { ...models.flat, version: 2 } }, meta, active: 'flat' });
+  check('a model from an older version is rejected', loadCalibration() === null);
+
+  saveCalibration({ models: { pose: models.pose }, meta, active: 'flat' });
+  check('an active set that did not fit falls back to one that did', loadCalibration().active === 'pose');
+
+  clearCalibration();
+  check('clearing removes it', loadCalibration() === null);
+  check('  and the old v2 key with it', store.size === 0);
+}
+
+// ── fitting a set from samples collected before it existed ──────────────────
+// The samples keep every raw feature rather than a pre-built design row, which
+// is what lets a new feature set be fitted from an old calibration instead of
+// needing everyone to sit through another one.
+{
+  const both = fitAll(trained.samples);
+  check('fitAll re-fits from stored samples', both.flat.ok && both.pose.ok);
+  const one = fit(trained.samples, 'flat');
+  check('a single set can be fitted on its own', one.ok && one.model.set === 'flat');
+  check('designRow defaults to the baseline', designRow(trained.samples[0].f).length === FEATURE_TERMS.flat);
 }
 
 report('calibrate');

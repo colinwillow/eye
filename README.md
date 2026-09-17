@@ -35,35 +35,67 @@ From there:
    Average the two eyes.
 2. **Head pose**, as the nose tip against the midpoint between the eyes in the
    same frame. Your head does a lot of the aiming and the fit needs to know.
-3. **Calibrate**: nine dots, ~13 seconds, then one ridge-regularised
-   least-squares fit from those features to a screen position. Second order,
-   so it can cope with the fact that eye rotation maps to screen position
-   through a tangent and the camera is above the screen rather than behind it.
-4. **Smooth** with a One Euro filter, which is heavy while you hold a gaze and
+3. **Head pose**, properly, out of MediaPipe's facial transformation matrix —
+   a real 3D pose solved against its canonical face model. Plus where the head
+   *is* in the frame, which is a different question from which way it points
+   and matters just as much.
+4. **Calibrate**: nine dots held still, then four more where you keep looking
+   at the dot and slowly move your head. About 22 seconds, then a
+   ridge-regularised least-squares fit from those features to a screen
+   position.
+5. **Smooth** with a One Euro filter, which is heavy while you hold a gaze and
    light while you move — a single exponential smoother has to pick one.
 
 The calibration is kept in `localStorage`, so a reload does not cost you
 another thirteen seconds.
 
+### Two models, one calibration, and a button that flips between them
+
+The calibration fits **both** a `flat` model (eyes only, plus two crude head
+proxies — the original) and a `pose` model (real head pose, head position, and
+the cross terms that let head and eyes be told apart) from the *same* samples.
+The **model** button switches between them live. That is the only honest way to
+compare: two separate calibrations differ by how you sat and where the light
+was, and those differences are bigger than the difference between the models.
+
+Why it matters, and it is bigger than it sounds: **a phone at arm's length
+subtends about 12 degrees.** Turn your head 17 — which is nothing, it is
+glancing at someone beside you — and the point your eyes must aim at swings by
+more than a screen width. Head movement is not a small perturbation on eye
+movement here, it is the dominant term. In simulation, the flat model goes from
+3.6% error with a still head to unusable with a moving one; the pose model
+holds around 5%.
+
+That is also why propping the phone against something transforms it. Not that
+the tracker needs a still head — that it could not *see* the head move.
+
 ### What accuracy to expect
 
-Somewhere around **2–5 cm on a phone at arm's length**, degrading as you move
-your head away from where you calibrated. It is enough to tell which quadrant
-of the screen you are looking at, comfortably enough for a 3x3 grid of targets,
-and not enough to pick a word out of a paragraph.
+Somewhere around **2–5 cm on a phone at arm's length**. Enough to tell which
+quadrant of the screen you are looking at, comfortably enough for a 3x3 grid of
+targets, and not enough to pick a word out of a paragraph.
 
-The limits are physical, not fixable by better code:
+For scale: Google's 2020 smartphone eye tracker reached **0.46 cm**, and the
+commercial mobile SDKs land around 1.7 degrees (≈1 cm at arm's length). Both
+get there the same way, and it is not a better fit — they run a CNN over the
+**eye-crop pixels**, trained on a lot of faces.
+
+That is the real ceiling here. A landmark is an information bottleneck: the
+iris points are trained to *outline the iris*, and the outline throws away the
+corneal reflection, the exact curvature of the limbus and the eyelid shape —
+all of which carry gaze. No amount of cleverness downstream recovers what the
+landmark did not encode. Careful engineering on top of landmarks gets you to
+maybe 1.5–2.5 cm; past that needs a different model.
+
+The rest of the limits are physical:
 
 * The iris is about 30 px across in a 720p frame, so one pixel of landmark
   noise is a visible wobble.
 * A front camera sits above the screen, so vertical gaze is measured off a
   smaller range than horizontal and the eyelid hides part of it.
-* Everything is relative to the head, so leaning changes the mapping. Big
-  moves want a recalibration.
 
-If you want it dramatically better, the answer is not a smarter fit — it is
-dedicated hardware pointed at the eye from close up, which is exactly what the
-Quest Pro has and the Quest 3 does not.
+Sources: [Google / Nature Communications 2020](https://www.nature.com/articles/s41467-020-18360-5) ·
+[SeeSo mobile SDK](https://www.prnewswire.com/news-releases/visualcamp-launches-mobile-eye-tracking-software-seeso-2-0--301078495.html)
 
 ## Running it
 
@@ -72,12 +104,13 @@ loaded from a pinned CDN URL.
 
 ```sh
 npm start     # static server on :8123
-npm test      # 171 headless checks: maths, directions, wiring
+npm test      # 273 headless checks: maths, directions, wiring
 ```
 
-`npm test` runs in node with nothing installed. It has already caught two real
-bugs — a ridge penalty that was quietly flattening the vertical axis, and a
-relative import resolving against the wrong base.
+`npm test` runs in node with nothing installed. It has already caught three
+real bugs — a ridge penalty quietly flattening the vertical axis, a relative
+import resolving against the wrong base, and a calibration that collected 415
+samples and then silently discarded every one of them.
 
 ```sh
 npm run vendor        # pull MediaPipe + the model local (~40MB, gitignored)
@@ -110,7 +143,7 @@ src/
   main.js           boot, the loop, modes, the HUD
   tracker.js        the MediaPipe FaceLandmarker, and blink-as-an-event
   features.js       landmarks -> gaze features. All the sign conventions.
-  calibrate.js      the nine-dot sequence, the fit, persistence
+  calibrate.js      the two-pass sequence, both fits, persistence
   solve.js          ridge regression and a Gaussian elimination
   filter.js         One Euro
   draw.js           the overlay, the dot, the calibration dots

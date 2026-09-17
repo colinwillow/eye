@@ -53,6 +53,7 @@
     <button data-act="calibrate" class="go">calibrate</button>
   </div>
   <div class="row">
+    <button data-act="model">model</button>
     <button data-act="mesh">mesh</button>
     <button data-act="reset">reset</button>
     <button data-act="clear">clear</button>
@@ -62,7 +63,9 @@
 <!-- Shown for a beat before the first dot appears. Without it the first dot
      lands while you are still looking at the button you just pressed, and its
      sample is a record of you looking at the bottom of the screen. -->
-<div id="calintro"><div>look at each dot<br>until it fills</div><small>nine dots · about 13 seconds · hold still</small></div>
+<!-- Filled in by showCalCard(): the two passes ask for different things and
+     the second one looks identical to the first if nothing says otherwise. -->
+<div id="calintro"><div>look at each dot<br>until it fills</div><small>nine dots · hold still</small></div>
 
 <div id="boot">
   <div class="card">

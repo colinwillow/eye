@@ -17,7 +17,7 @@ Don't open a pull request unless asked.
 ## Test before you push
 
 ```sh
-npm test                              # ~171 checks, node only, ~2s
+npm test                              # ~273 checks, node only, ~3s
 npm run vendor && npm run test:smoke   # the real page in real Chromium, ~40s
 ```
 
@@ -70,6 +70,87 @@ The only place a sign is asserted rather than derived is `rawMapping`, the
 uncalibrated preview, and it is labelled UNCALIBRATED on the HUD for that
 reason. If it ever moves the wrong way on a real phone, flip `RAW_GAIN.x` —
 it does not affect anything calibrated.
+
+## Head movement is the dominant term, not a perturbation
+
+The number that reframes everything here: **a phone at arm's length subtends
+about 12 degrees.** A 17-degree head turn — glancing at someone beside you —
+swings the point your eyes must aim at by more than a whole screen width. Eye
+rotation across the entire screen is smaller than a head movement you would not
+notice making.
+
+So "it works better if you prop the phone up" is not a tolerance problem. It is
+that the tracker could not SEE the head move, and head movement is bigger than
+the signal.
+
+Three things follow, and they are why `features.js` looks the way it does:
+
+* **Rotation is not enough — position matters too.** Every gaze feature here is
+  deliberately translation-invariant (a face crossing the frame is not a
+  glance, and `tests/features.mjs` pins that). But invariance is exactly wrong
+  for mapping to a screen: slide your head sideways without turning it and
+  every target is at a new angle while every rotation feature reads identically.
+  `faceX`, `faceY` and `span` carry it, and only the `pose` set uses them.
+* **A turned head RESCALES the mapping, it does not shift it.** Screen position
+  is `D * tan(headYaw + eyeAngle)`, and the tangent of a sum multiplies the
+  eye's contribution by `(1 + tan^2 yaw)`. Head terms alone can only shift. The
+  `gx*yaw` and `gy*pitch` CROSS TERMS are the whole point of the pose set.
+* **The two eyes stop agreeing under yaw**, because the near one is closer and
+  projects bigger. `asym` and `widthRatio` read that straight off the landmarks
+  with no matrix involved, which is what the pose model falls back on.
+
+### The features and the head pass only work as a PAIR
+
+Cross terms were in an early version and measured as worthless, because a
+calibration done with a still head contains no head variation for them to
+explain — ridge correctly shrank them to zero. The terms were never the
+problem; the calibration was.
+
+Hence the second calibration pass: four corner dots where you keep looking at
+the dot and move your head. Adding either half alone measures as no improvement
+at all, and `tests/calibrate.mjs` has a check that says exactly this — it fits
+the pose features from a still-only calibration and asserts they *fail* to beat
+the baseline. If someone ever "simplifies" the calibration back to one pass,
+that check is what explains why they cannot.
+
+### Never judge these two models by their training residual
+
+`flat` reports the LOWER residual, every time, because it is fitted only to the
+still pass while `pose` is fitted to still plus head-movement. A residual
+measured on a calibration where the head never moved is a score for a test that
+left out the thing being tested. Judge on held-out points with the head moving —
+`evaluate()` in `tests/calibrate.mjs`.
+
+## Both models are kept, and a button flips between them
+
+One calibration, two fits, stored side by side, switchable live from the bar.
+This is deliberate and it should stay: the only way to answer "is head-pose
+compensation actually better on a real face" is to switch between them in one
+session without recalibrating in between. Two separate calibrations differ by
+how you sat and where the light was, and that is a bigger difference than the
+one being measured.
+
+`flat` is kept **bit-identical** on purpose. It is the version that was
+measured to work on a real phone, and a new idea does not get to quietly move
+the baseline it is supposed to beat.
+
+Samples are stored as raw features rather than as built design rows, so a
+feature set added later can be fitted from a calibration collected before it
+existed.
+
+## The ceiling is the landmark, not the fit
+
+Google's smartphone eye tracker reached 0.46 cm and the commercial mobile SDKs
+land near 1.7 degrees. Neither does it with a better regression — both run a
+CNN over the **eye-crop pixels**.
+
+A landmark is an information bottleneck. The iris points are trained to outline
+the iris, and the outline discards the corneal reflection, the exact limbus
+curvature and the eyelid shape, all of which carry gaze. Nothing downstream
+recovers what the landmark did not encode. Careful work on top of landmarks
+gets to maybe 1.5-2.5 cm; past that is a different model, not a better fit.
+
+Worth knowing before spending a week on a cleverer regression.
 
 ## A ridge penalty is per-column, so the columns must be scaled
 
@@ -125,6 +206,11 @@ toward the origin, which on a screen is the top-left corner.
 * **A 468-point mesh is not a degraded 478-point one, it is useless.** Every
   eye-shaped measurement still works and the gaze reads as a constant zero.
   `extract` rejects it by length.
+* **A stored sample is not a live detection.** `usable()` gates on `f.ok`, and
+  the calibration's flat copy of the features dropped it — so every one of 415
+  collected samples failed the gate and both fits reported `too-few-samples`.
+  It surfaces as a calibration that politely refuses, not as an error.
+  `tests/calibrate.mjs` now compares what a fit KEPT against what was collected.
 * **`play()` rejecting on iOS is not a failure.** The await on getUserMedia
   has already closed the user-gesture window and Safari counts that against an
   explicit `play()`; the autoplay attribute starts it anyway. What matters is
@@ -136,9 +222,27 @@ toward the origin, which on a screen is the top-left corner.
   for picking something.
 * **No dwell selection**, which is the other half of a usable gaze UI — hold
   the gaze inside a radius for N ms and commit.
-* **No head-movement compensation beyond the two pose features.** Leaning a
-  long way from where you calibrated drifts, and the honest fix is either
-  recalibrating or a much better head model.
+* **The 3D route is not taken.** The proper version of head compensation is not
+  more regression terms at all: take the head pose, put the eyeball CENTRE
+  where the canonical model says it is (about 1.2 cm behind the iris), build
+  the gaze ray as `iris - eyeballCentre` in camera space, and intersect it with
+  the screen plane. Calibration then fits two things with physical meaning —
+  the kappa angle between each person's optical and visual axis, and where the
+  screen sits relative to the camera — instead of fourteen polynomial
+  coefficients. It extrapolates properly outside the calibrated range, which
+  regression never does. It needs the metric scale of MediaPipe's matrix
+  checked against a tape measure first; the HUD prints `dist` raw for exactly
+  that.
+* **Nothing has been measured on a real face.** Every accuracy number in the
+  tests comes from a synthetic eyeball with the right geometry. It is enough to
+  prove one model beats another and that no sign is inverted; it is not
+  evidence about a person. The `model` button exists because that comparison
+  can only be settled on a phone.
+* **No fixation detection.** Gaze is saccades and fixations, not a continuous
+  signal. Detecting fixations (velocity below a threshold for ~100ms) and
+  holding the estimate through them would do more for how STEADY it feels than
+  any accuracy work — and for picking one of a few large regions, a classifier
+  with hysteresis beats regressing a point and thresholding it.
 * **Nothing is wired to the games yet.** The output is a normalised 0..1 point
   and a click, which is the same shape as a pointer — `peggy`, `BigDon` and
   `robits` all take a stick, not a point, so something has to convert.

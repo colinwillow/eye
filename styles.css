@@ -92,6 +92,7 @@ body[data-mode="paint"]::after {
   backdrop-filter: blur(6px);
 }
 #hud .warn, #note.err { color: var(--warn); }
+#hud .dim { color: #6d7f90; }
 
 #note {
   position: fixed; z-index: 6;
@@ -156,7 +157,8 @@ body.calibrating #camwrap { transition: opacity .25s; }
   opacity: 0; pointer-events: none;
   transition: opacity .3s;
 }
-#calintro small { font-size: 11.5px; color: #7d8fa0; letter-spacing: .04em; }
+#calintro small { font-size: 11.5px; color: #7d8fa0; letter-spacing: .04em; max-width: 78vw; display: block; }
+#calintro b { color: var(--warn); }
 #calintro.show { opacity: 1; }
 
 /* ── Boot card ─────────────────────────────────────────────────────────── */

@@ -110,8 +110,59 @@ export function headPose(lm, L, R) {
   };
 }
 
+// ── Head pose, properly ─────────────────────────────────────────────────────
+// MediaPipe will hand back a 4x4 that maps its canonical face model onto the
+// face it found, which is a real 3D head pose solved against a known head
+// shape — far better than inferring one from where the nose landed. We were
+// already asking for it in the options and then ignoring it.
+//
+// The matrix is COLUMN-MAJOR, so data[0..2], data[4..6] and data[8..10] are
+// the face's own x, y and z axes expressed in camera space, and data[12..14]
+// is where the head is.
+//
+// What comes out of here is deliberately convention-light: the direction the
+// face points, in camera coordinates, rather than Euler angles in somebody's
+// particular order. Two reasons. Euler extraction needs you to know the axis
+// convention and the rotation order, and getting either wrong gives you angles
+// that look plausible and are coupled to each other. And a direction vector is
+// testable against a synthetic rotation without knowing anything about
+// MediaPipe at all.
+//
+// The SIGNS are not asserted anywhere. These go into a least-squares fit,
+// which derives them — same discipline as the iris offsets. All that is
+// required of them is that they move monotonically with head rotation and do
+// not move at all when only the eyes move.
+export function matrixPose(matrix) {
+  const m = matrix?.data;
+  if (!m || m.length < 16) return null;
+
+  // Third column: the face's forward axis, in camera space.
+  const f = { x: m[8], y: m[9], z: m[10] };
+  const n = Math.hypot(f.x, f.y, f.z);
+  if (!(n > 1e-6)) return null;
+  f.x /= n; f.y /= n; f.z /= n;
+
+  // First column: the face's own right axis. Its tilt in the image plane is
+  // roll, and it is measured separately so a tilted head does not leak into
+  // the other two.
+  const r = { x: m[0], y: m[1] };
+
+  return {
+    yaw: Math.atan2(f.x, Math.abs(f.z) > 1e-6 ? f.z : 1e-6),
+    pitch: Math.asin(Math.max(-1, Math.min(1, -f.y))),
+    roll: Math.atan2(r.y, r.x),
+    // Distance from the camera. The canonical model is metric, so this is a
+    // real length — but which unit is MediaPipe's business, and nothing here
+    // needs to know: solveRidge scales every column by its own RMS, so a
+    // feature measured in centimetres and the same feature in metres produce
+    // identical predictions. The HUD prints it raw so it can be checked
+    // against a tape measure on an actual phone.
+    dist: Math.hypot(m[12], m[13], m[14]),
+  };
+}
+
 // Everything the rest of the app needs out of one detection.
-export function extract(lm) {
+export function extract(lm, matrix = null) {
   if (!lm || lm.length < LANDMARKS_WITH_IRIS) return { ok: false, reason: lm ? 'no-iris' : 'no-face' };
 
   const L = eyeMetrics(lm, EYES.left);
@@ -121,37 +172,118 @@ export function extract(lm) {
   const head = headPose(lm, L, R);
   if (!head) return { ok: false, reason: 'degenerate' };
 
-  // Average the two eyes. One eye alone works, but it is noticeably noisier
-  // and it picks up the asymmetry of a face turned off-axis.
+  // Average the two eyes. One eye alone works, but it is noticeably noisier.
+  //
+  // What the average THROWS AWAY is the difference between them, and that
+  // difference is not noise — turn your head and the near eye foreshortens
+  // while the far one does not, so the two iris offsets stop agreeing in a way
+  // that depends only on yaw. `asym` keeps it, and `widthRatio` is the same
+  // information read off the eye widths instead, which does not involve the
+  // irises at all. Both are head-pose signals that need no matrix.
+  const pose = matrixPose(matrix);
+
+  // Where the head IS in the frame, as opposed to which way it is pointing.
+  //
+  // Every other feature here is deliberately translation-invariant — a face
+  // crossing the frame is not a glance, and tests/features.mjs pins that. But
+  // invariance is exactly wrong for the mapping to a SCREEN: move your head
+  // ten centimetres to the left without turning it and every point on the
+  // screen is at a different angle from your eye, while every rotation-based
+  // feature reads identically. That is most of why propping the phone on
+  // something works so much better than holding it — not that the tracker
+  // needs a still head, but that it could not see the head move.
+  //
+  // So the position is passed through separately and only the `pose` set uses
+  // it. `span` (inter-ocular width in the frame) is the third axis of the same
+  // thing: it is how far away you are, measured off the image rather than off
+  // the matrix, and it works when the matrix is missing.
+  const centre = {
+    x: (L.centre.x + R.centre.x) / 2,
+    y: (L.centre.y + R.centre.y) / 2,
+  };
+
   return {
     ok: true,
     gx: (L.offU + R.offU) / 2,
     gy: (L.offV + R.offV) / 2,
+    asym: L.offU - R.offU,
+    widthRatio: Math.log((L.width + 1e-9) / (R.width + 1e-9)),
     hx: head.hx,
     hy: head.hy,
     roll: head.roll,
     span: head.span,
+    faceX: centre.x,
+    faceY: centre.y,
+    centre,
     ear: (L.ear != null && R.ear != null) ? (L.ear + R.ear) / 2 : null,
+    // Null whenever the matrix is missing. Nothing may quietly substitute a
+    // zero: a constant column is indistinguishable from the intercept, and the
+    // fit would report a healthy residual for a model that had silently
+    // stopped using head pose at all.
+    pose,
     L, R,
   };
 }
 
 // ── The design row ──────────────────────────────────────────────────────────
-// Order 1 is a plane through the features; order 2 adds the quadratic terms
-// that soak up the fact that eye rotation maps to screen position through a
-// tangent, not a line, and that the camera sits above the screen rather than
-// behind it.
+// Two feature sets, fitted from the SAME collected samples so they can be
+// compared on one calibration rather than two.
 //
-// Order 2 is eight terms against nine calibration points, which is why the fit
-// is ridged. Ten terms (adding gx*hx, gy*hy) was tried and the head-cross
-// columns are dead — a calibration is done with a still head, so there is no
-// head variation for them to explain and ridge just shrinks them back to zero.
-export const ORDER_TERMS = { 1: 5, 2: 8 };
+// `flat` is the original. Eye offsets, their quadratic terms, and the two
+// crude nose-against-eyes head proxies. It is kept bit-identical on purpose:
+// it is the version that was measured to work, and a new idea does not get to
+// quietly replace the baseline it is supposed to beat.
+//
+// `pose` adds real head pose and, more importantly, the CROSS TERMS. Those are
+// the whole point. The head terms on their own only let the fit say "your head
+// moved, so shift the estimate"; gx*yaw lets it say "your head is turned, so
+// the SAME iris offset means something different now" — which is what actually
+// happens, because the iris offset is measured in the head's frame and the
+// screen is not.
+//
+// Why the original had no cross terms: they were tried and they were DEAD. A
+// calibration performed with a still head contains no head variation for them
+// to explain, so ridge correctly shrank them to nothing. The terms were never
+// the problem; the calibration was. Hence the head-movement pass in
+// calibrate.js — the two changes only work as a pair, and adding either one
+// alone measures as no improvement at all.
+export const FEATURE_SETS = {
+  flat: {
+    needsPose: false,
+    row: f => [1, f.gx, f.gy, f.gx * f.gy, f.gx * f.gx, f.gy * f.gy, f.hx, f.hy],
+  },
+  pose: {
+    needsPose: true,
+    row: f => {
+      const { gx, gy, asym, widthRatio, faceX, faceY, span } = f;
+      const { yaw, pitch, dist } = f.pose;
+      return [
+        1,
+        gx, gy, gx * gy, gx * gx, gy * gy,   // where the eyes point
+        asym, widthRatio,                     // head yaw, straight off the two eyes
+        yaw, pitch, dist,                     // which way the head points
+        faceX, faceY, span,                   // and where it actually is
+        gx * yaw, gy * pitch,                 // the compensation that matters
+        gx * pitch, gy * yaw,                 // and the off-diagonal half of it
+      ];
+    },
+  },
+};
 
-export function designRow(f, order = 2) {
-  const { gx, gy, hx, hy } = f;
-  if (order === 1) return [1, gx, gy, hx, hy];
-  return [1, gx, gy, gx * gy, gx * gx, gy * gy, hx, hy];
+export const FEATURE_TERMS = Object.fromEntries(
+  Object.entries(FEATURE_SETS).map(([k, v]) => [k, v.row({
+    gx: 0, gy: 0, hx: 0, hy: 0, asym: 0, widthRatio: 0,
+    faceX: 0, faceY: 0, span: 0, pose: { yaw: 0, pitch: 0, dist: 0 },
+  }).length]));
+
+export function designRow(f, set = 'flat') {
+  return FEATURE_SETS[set].row(f);
+}
+
+// Whether a sample carries everything a given set needs.
+export function usable(f, set) {
+  if (!f || !f.ok) return false;
+  return !FEATURE_SETS[set].needsPose || !!f.pose;
 }
 
 // ── The uncalibrated mapping ────────────────────────────────────────────────

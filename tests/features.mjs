@@ -4,8 +4,9 @@
 // and a suite that only asserted "the features moved" would pass the whole
 // time. So each check below pins a DIRECTION or an INVARIANCE, never just a
 // magnitude.
-import { extract, rawMapping, eyeMetrics, EYES, LANDMARKS_WITH_IRIS } from '../src/features.js';
-import { check, near, report, makeFace } from './harness.mjs';
+import { extract, rawMapping, eyeMetrics, matrixPose, designRow, usable,
+         FEATURE_SETS, FEATURE_TERMS, EYES, LANDMARKS_WITH_IRIS } from '../src/features.js';
+import { check, near, report, makeFace, makeMatrix } from './harness.mjs';
 
 // ── the signal exists and is zero when it should be ─────────────────────────
 {
@@ -142,6 +143,112 @@ import { check, near, report, makeFace } from './harness.mjs';
   lm[33] = { ...lm[133] };            // both corners in the same place
   const f = extract(lm);
   check('a zero-width eye is rejected rather than returning NaN', !f.ok, JSON.stringify(f.gx));
+}
+
+
+// ── HEAD POSE OUT OF THE TRANSFORMATION MATRIX ──────────────────────────────
+// The three angles have to be DECOUPLED. Euler extraction with the wrong
+// rotation order gives you angles that look plausible, move in roughly the
+// right direction, and quietly contain each other — so a pure yaw also reads
+// as some pitch, and the fit ends up with two columns that are partly the same
+// column. Ridge does not fix that; it just shares the coefficient between them.
+{
+  const flat = matrixPose(makeMatrix({}));
+  near('a head facing the camera reads zero yaw', flat.yaw, 0, 1e-9);
+  near('  zero pitch', flat.pitch, 0, 1e-9);
+  near('  zero roll', flat.roll, 0, 1e-9);
+  near('  and the distance straight off the translation', flat.dist, 35, 1e-9);
+
+  for (const d of [-30, -15, 15, 30]) {
+    const r = d * Math.PI / 180;
+    const y = matrixPose(makeMatrix({ yaw: r }));
+    check(`yaw ${d} is monotonic`, Math.sign(y.yaw) === Math.sign(d) && Math.abs(y.yaw) > 0.1);
+    near(`  and leaks no pitch`, y.pitch, 0, 1e-9);
+    near(`  and leaks no roll`, y.roll, 0, 1e-9);
+
+    const p = matrixPose(makeMatrix({ pitch: r }));
+    check(`pitch ${d} is monotonic`, Math.abs(p.pitch) > 0.1);
+    near(`  and leaks no yaw`, p.yaw, 0, 1e-9);
+  }
+  // Roll is measured off a different column on purpose, so it stays clean.
+  const rolled = matrixPose(makeMatrix({ roll: 0.4 }));
+  near('roll is recovered', Math.abs(rolled.roll), 0.4, 1e-9);
+  near('  and leaks no yaw', rolled.yaw, 0, 1e-9);
+
+  check('a missing matrix is null, not zeroes', matrixPose(null) === null);
+  check('a short matrix is null', matrixPose({ data: [1, 0, 0] }) === null);
+}
+
+// ── HEAD POSE MUST NOT MOVE WHEN ONLY THE EYES DO ───────────────────────────
+// This is the property that makes the cross terms mean anything. If the head
+// features drifted with gaze, gx*yaw would be partly gx*gx and the fit would
+// have no way to tell "you turned your head" from "you looked further across".
+{
+  const a = extract(makeFace({ gx: -0.09 }), makeMatrix({ yaw: 0 }));
+  const b = extract(makeFace({ gx: +0.09 }), makeMatrix({ yaw: 0 }));
+  near('yaw is unmoved by a glance', a.pose.yaw, b.pose.yaw, 1e-12);
+  near('pitch is unmoved by a glance', a.pose.pitch, b.pose.pitch, 1e-12);
+  near('asym is unmoved by a glance', a.asym, b.asym, 1e-9);
+  near('widthRatio is unmoved by a glance', a.widthRatio, b.widthRatio, 1e-9);
+}
+
+// ── THE TWO EYES DISAGREE UNDER YAW, AND THAT IS THE SIGNAL ─────────────────
+// Turning the head brings one eye nearer the camera, so it projects bigger.
+// Averaging the eyes throws that away; `asym` and `widthRatio` keep it, and
+// they are head-pose readings that need no matrix at all — which is what the
+// pose model falls back on if MediaPipe ever stops handing one over.
+{
+  const straight = extract(makeFace({}));
+  near('a straight-on face is symmetric', straight.widthRatio, 0, 1e-9);
+  near('  and has no iris asymmetry', straight.asym, 0, 1e-9);
+
+  const left = extract(makeFace({ yaw: -0.35 }));
+  const right = extract(makeFace({ yaw: +0.35 }));
+  check('yaw shows up in the eye widths', Math.abs(right.widthRatio) > 0.02, String(right.widthRatio));
+  check('  and flips with the direction of the turn', left.widthRatio * right.widthRatio < 0);
+  near('  symmetrically', left.widthRatio, -right.widthRatio, 1e-9);
+
+  // Strictly monotonic, not just non-zero: a feature that saturates or turns
+  // around is one the fit can only use over half its range. The DIRECTION is
+  // not asserted — which eye the ratio is taken over is an arbitrary choice
+  // and the fit derives the sign — but it has to be the same direction all the
+  // way along, which is the part that is actually a property of the feature.
+  const ws = [-0.4, -0.2, 0, 0.2, 0.4].map(y => extract(makeFace({ yaw: y })).widthRatio);
+  const dir = Math.sign(ws[1] - ws[0]);
+  check('widthRatio moves with yaw at all', dir !== 0);
+  for (let i = 1; i < ws.length; i++) {
+    check(`widthRatio is strictly monotonic across step ${i}`,
+      Math.sign(ws[i] - ws[i - 1]) === dir, `${ws[i - 1]} -> ${ws[i]}`);
+  }
+  check('and it does not saturate at the ends',
+    Math.abs(ws[4] - ws[3]) > Math.abs(ws[3] - ws[2]) * 0.5,
+    ws.map(w => w.toFixed(4)).join(' '));
+}
+
+// ── THE FEATURE SETS ────────────────────────────────────────────────────────
+{
+  const f = extract(makeFace({ gx: 0.04, gy: 0.02 }), makeMatrix({ yaw: 0.2 }));
+  for (const [name, set] of Object.entries(FEATURE_SETS)) {
+    const row = designRow(f, name);
+    check(`${name} row is the advertised width`, row.length === FEATURE_TERMS[name]);
+    check(`${name} row is all finite`, row.every(Number.isFinite), JSON.stringify(row));
+    check(`${name} starts with the intercept`, row[0] === 1);
+    check(`${name} declares its need for pose correctly`, set.needsPose === (name === 'pose'));
+  }
+
+  // The flat set must not have quietly changed — it is the measured baseline
+  // and a new idea does not get to move the thing it is being compared against.
+  const flatRow = designRow(f, 'flat');
+  check('flat is still the original eight terms', flatRow.length === 8);
+  near('flat term 1 is still gx', flatRow[1], f.gx, 1e-12);
+  near('flat term 6 is still hx', flatRow[6], f.hx, 1e-12);
+
+  // A pose row without a matrix would be full of NaN. usable() is what keeps
+  // those samples out of the fit, rather than letting them poison it.
+  const noPose = extract(makeFace({}));
+  check('a sample with no matrix is unusable for pose', !usable(noPose, 'pose'));
+  check('  but still usable for flat', usable(noPose, 'flat'));
+  check('pose is null rather than zeroed when there is no matrix', noPose.pose === null);
 }
 
 report('features');

@@ -130,8 +130,13 @@ export function drawGaze(ctx, p, { w, h, confident = true, blink = false, trail 
 // A calibration dot: a ring that closes while the eyes settle, then a core
 // that fills while samples are taken. Two visibly different phases, because
 // "hold still, it is taking this one now" has to be readable without text.
-export function drawCalDot(ctx, p, phase, t) {
+//
+// The head pass is amber instead of blue, and it is a colour rather than a
+// caption for the same reason: during a calibration you are looking at the
+// dot, so the dot is the only place a message can be put.
+export function drawCalDot(ctx, p, phase, t, pass = 1) {
   const R = 26;
+  const live = pass === 2 ? '#ffb36b' : '#7ce0ff';
   ctx.save();
   ctx.translate(p.x, p.y);
 
@@ -144,12 +149,12 @@ export function drawCalDot(ctx, p, phase, t) {
     ctx.lineWidth = 3;
     ctx.beginPath(); ctx.arc(0, 0, R + 14 * (1 - t), 0, Math.PI * 2); ctx.stroke();
   } else {
-    ctx.strokeStyle = '#7ce0ff';
+    ctx.strokeStyle = live;
     ctx.lineWidth = 5;
     ctx.beginPath(); ctx.arc(0, 0, R, -Math.PI / 2, -Math.PI / 2 + t * Math.PI * 2); ctx.stroke();
   }
 
-  ctx.fillStyle = phase === 'collect' ? '#7ce0ff' : '#ffffff';
+  ctx.fillStyle = phase === 'collect' ? live : '#ffffff';
   ctx.beginPath(); ctx.arc(0, 0, phase === 'collect' ? 9 : 6, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
 }
