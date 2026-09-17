@@ -1,0 +1,187 @@
+:root {
+  --bg: #07090d;
+  --ink: #dfeaf2;
+  --accent: #7ce0ff;
+  --warn: #ffb36b;
+  --pad: 10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--ink);
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  /* A gaze demo has nothing to scroll and nothing to zoom, and both gestures
+     fire constantly from a thumb resting near the edge. */
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+/* ── The camera picture ─────────────────────────────────────────────────────
+   Full screen while you are looking at your own face; a corner thumbnail once
+   the point is the dot rather than the tracking. The transition is on the box,
+   not on the video, so the overlay canvas rides along exactly. */
+#camwrap {
+  position: fixed; z-index: 1;
+  top: 0; left: 0; width: 100%; height: 100%;
+  border-radius: 0; overflow: hidden;
+  transition: top .38s cubic-bezier(.2,.8,.25,1), left .38s cubic-bezier(.2,.8,.25,1),
+              width .38s cubic-bezier(.2,.8,.25,1), height .38s cubic-bezier(.2,.8,.25,1),
+              border-radius .38s, opacity .3s;
+}
+body[data-mode="gaze"] #camwrap,
+body[data-mode="paint"] #camwrap {
+  top: calc(env(safe-area-inset-top, 0px) + var(--pad));
+  left: auto; right: calc(env(safe-area-inset-right, 0px) + var(--pad));
+  width: 26vmin; height: 34vmin;
+  border-radius: 14px;
+  opacity: .55;
+  box-shadow: 0 6px 22px rgba(0,0,0,.6);
+}
+/* right + left:auto do not animate together cleanly, so pin it by transform
+   instead when it is a thumbnail. */
+body[data-mode="gaze"] #camwrap,
+body[data-mode="paint"] #camwrap { left: auto; }
+
+#cam, #overlay {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  display: block;
+}
+#cam {
+  object-fit: cover;
+  /* Selfie view. draw.js mirrors the landmarks to match; if you remove one,
+     remove both or the dots sit on the wrong side of the face. */
+  transform: scaleX(-1);
+}
+
+#paint, #stage {
+  position: fixed; inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+#paint { z-index: 2; }
+#stage { z-index: 3; }
+
+body[data-mode="face"] #paint { display: none; }
+
+/* A dark wash behind the dot so it reads — but only when the camera is not
+   the subject. */
+body[data-mode="gaze"]::after,
+body[data-mode="paint"]::after {
+  content: ''; position: fixed; inset: 0; z-index: 0;
+  background: radial-gradient(120% 90% at 50% 40%, #0d1420 0%, #05070a 100%);
+}
+
+/* ── HUD ───────────────────────────────────────────────────────────────── */
+#hud {
+  position: fixed; z-index: 5;
+  top: calc(env(safe-area-inset-top, 0px) + var(--pad));
+  left: calc(env(safe-area-inset-left, 0px) + var(--pad));
+  padding: 7px 10px;
+  background: rgba(5,8,12,.62);
+  border: 1px solid rgba(124,224,255,.16);
+  border-radius: 9px;
+  font-size: 11px; line-height: 1.5;
+  letter-spacing: .02em;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+#hud .warn, #note.err { color: var(--warn); }
+
+#note {
+  position: fixed; z-index: 6;
+  left: 50%; transform: translateX(-50%);
+  /* clears both rows of the bar: 2 x 44 + 6 gap + 8 offset, plus air */
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 118px);
+  max-width: min(92vw, 520px);
+  padding: 9px 14px;
+  text-align: center;
+  background: rgba(5,8,12,.86);
+  border: 1px solid rgba(124,224,255,.22);
+  border-radius: 999px;
+  opacity: 0; transition: opacity .25s;
+  pointer-events: none;
+}
+#note.show { opacity: 1; }
+
+/* ── The bar ───────────────────────────────────────────────────────────────
+   Two thumbs, no keyboard: every target is at least 44px tall and they sit
+   along the bottom edge where a thumb already is. */
+#bar {
+  position: fixed; z-index: 5;
+  left: 0; right: 0;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+  display: flex; flex-direction: column; gap: 6px;
+  align-items: center;
+  padding: 0 10px;
+}
+#bar .row { display: flex; gap: 6px; justify-content: center; }
+#bar button {
+  appearance: none;
+  min-height: 44px; padding: 0 14px;
+  font: inherit; font-size: 12px; letter-spacing: .04em;
+  color: var(--ink);
+  background: rgba(10,16,24,.78);
+  border: 1px solid rgba(124,224,255,.22);
+  border-radius: 12px;
+  backdrop-filter: blur(8px);
+}
+#bar button.on { background: rgba(124,224,255,.2); border-color: var(--accent); color: #eafaff; }
+#bar button.go { border-color: rgba(255,209,102,.5); color: #ffd166; }
+#bar button:active { transform: scale(.96); }
+
+/* ── Calibrating ───────────────────────────────────────────────────────────
+   A calibration screen has exactly one thing on it. Everything else is hidden,
+   including the camera preview — every one of them sits where a dot is about
+   to be, and a dot you cannot see is a sample of you looking at the HUD that
+   is covering it. The top-left dot was behind the HUD, which is precisely the
+   corner a calibration most needs. */
+body.calibrating #hud,
+body.calibrating #bar,
+body.calibrating #note,
+body.calibrating #camwrap { opacity: 0; pointer-events: none; }
+body.calibrating #camwrap { transition: opacity .25s; }
+
+#calintro {
+  position: fixed; inset: 0; z-index: 6;
+  display: grid; place-content: center; justify-items: center; gap: 12px;
+  text-align: center;
+  font-size: 19px; line-height: 1.5; letter-spacing: .06em;
+  color: #eafaff;
+  opacity: 0; pointer-events: none;
+  transition: opacity .3s;
+}
+#calintro small { font-size: 11.5px; color: #7d8fa0; letter-spacing: .04em; }
+#calintro.show { opacity: 1; }
+
+/* ── Boot card ─────────────────────────────────────────────────────────── */
+#boot {
+  position: fixed; inset: 0; z-index: 10;
+  display: grid; place-items: center;
+  padding: 24px;
+  background: radial-gradient(120% 90% at 50% 30%, #101a28 0%, #05070a 100%);
+  transition: opacity .35s;
+}
+#boot.gone { opacity: 0; pointer-events: none; }
+#boot .card { max-width: 420px; text-align: center; }
+#boot h1 {
+  margin: 0 0 6px; font-size: 40px; letter-spacing: .3em;
+  color: var(--accent); text-indent: .3em;
+}
+#boot .sub { margin: 0 0 20px; color: #9fb3c4; }
+#boot .fine { margin-top: 18px; color: #7d8fa0; font-size: 11.5px; }
+#boot button {
+  appearance: none;
+  min-height: 52px; padding: 0 26px;
+  font: inherit; font-size: 14px; letter-spacing: .08em;
+  color: #04121a; background: var(--accent);
+  border: 0; border-radius: 14px;
+}
+#boot button:disabled { opacity: .5; }
+#boot-msg { min-height: 1.4em; margin: 14px 0 0; color: #9fb3c4; }
+#boot-msg.err { color: var(--warn); }

@@ -1,0 +1,13 @@
+{
+  "name": "eye",
+  "version": "0.1.0",
+  "description": "Phone eye tracking — MediaPipe iris landmarks, calibrated gaze, no build step",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8123",
+    "test": "node tests/run.mjs",
+    "test:smoke": "node tests/smoke.mjs",
+    "vendor": "bash tools/vendor.sh"
+  }
+}

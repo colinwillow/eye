@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover plus the safe-area insets in the CSS is what keeps the
+     bar off the home indicator and the HUD out of the notch. -->
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#07090d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="eye">
+<title>eye</title>
+<link rel="manifest" href="manifest.webmanifest">
+<!-- iOS reads these, not the manifest, and masks the corners itself — so the
+     art is full-bleed with no rounding baked in. All of them come out of
+     `python3 tools/make-icons.py`; edit that, not these. -->
+<link rel="apple-touch-icon" href="icons/apple-touch-icon-180.png">
+<link rel="apple-touch-icon" sizes="167x167" href="icons/apple-touch-icon-167.png">
+<link rel="apple-touch-icon" sizes="152x152" href="icons/apple-touch-icon-152.png">
+<link rel="apple-touch-icon" sizes="120x120" href="icons/apple-touch-icon-120.png">
+<link rel="icon" type="image/png" sizes="48x48" href="icons/favicon-48.png">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-mode="face">
+
+<!-- The camera picture and the landmark overlay are one unit: the overlay is
+     sized to the wrapper, so the same landmark->pixel map works whether the
+     picture is filling the screen or shrunk into the corner. -->
+<div id="camwrap">
+  <video id="cam" playsinline muted autoplay disablepictureinpicture></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<!-- Persistent: this one is bleached, never cleared. -->
+<canvas id="paint"></canvas>
+<!-- Per-frame: the gaze dot, the calibration dots, the blink ripples. -->
+<canvas id="stage"></canvas>
+
+<div id="hud"></div>
+<div id="note"></div>
+
+<!-- Two deliberate rows rather than one that happens to wrap: seven buttons
+     never fit across a phone, and a bar whose height depends on the viewport
+     is a bar nothing else can be positioned above. -->
+<div id="bar">
+  <div class="row">
+    <button data-mode="face" class="on">face</button>
+    <button data-mode="gaze">gaze</button>
+    <button data-mode="paint">paint</button>
+    <button data-act="calibrate" class="go">calibrate</button>
+  </div>
+  <div class="row">
+    <button data-act="mesh">mesh</button>
+    <button data-act="reset">reset</button>
+    <button data-act="clear">clear</button>
+  </div>
+</div>
+
+<!-- Shown for a beat before the first dot appears. Without it the first dot
+     lands while you are still looking at the button you just pressed, and its
+     sample is a record of you looking at the bottom of the screen. -->
+<div id="calintro"><div>look at each dot<br>until it fills</div><small>nine dots · about 13 seconds · hold still</small></div>
+
+<div id="boot">
+  <div class="card">
+    <h1>eye</h1>
+    <p class="sub">Iris tracking off the front camera. Nothing leaves the phone —
+      the video never goes anywhere, it is all decoded on-device.</p>
+    <button id="start">start camera</button>
+    <p id="boot-msg"></p>
+    <p class="fine">Hold the phone steady, roughly at arm&rsquo;s length, and get
+      some light on your face. Then hit <b>calibrate</b> — the rough mode before
+      that is only there to prove the signal is alive.</p>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
