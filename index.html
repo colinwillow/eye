@@ -5,6 +5,31 @@
 <!-- viewport-fit=cover plus the safe-area insets in the CSS is what keeps the
      bar off the home indicator and the HUD out of the notch. -->
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<!-- NO ZOOMING. A twin-stick game is two thumbs on glass, and every one of the
+     browser's own gestures is something a thumb does by accident: a double tap
+     while jabbing at a control, two fingers landing at once on the sticks.
+     THREE DIFFERENT MECHANISMS HAVE TO BE TURNED OFF AND ONLY ONE OF THEM IS
+     THE VIEWPORT META:
+
+       double-tap zoom  `touch-action` in the CSS. iOS Safari has IGNORED
+                        `user-scalable=no` since iOS 10 -- it is honoured on
+                        Android and nowhere else that matters, so the meta tag
+                        is not the fix and never was.
+       PINCH zoom       its own non-standard event family. `gesturestart` /
+                        `gesturechange` / `gestureend` fire for two fingers and
+                        zoom the page whatever the CSS says; `touch-action`
+                        does not cover them.
+       desktop          `dblclick`, belt and braces for a trackpad.
+
+     FIRST IN THE HEAD, with the crash trap, and deliberately not in a module:
+     a guard that only installs once the game has loaded is a guard that is
+     absent for the whole of the loading screen -- and missing entirely if the
+     module throws, which is exactly when somebody starts jabbing at it. -->
+<script>
+for (var i = 0, G = ['gesturestart', 'gesturechange', 'gestureend', 'dblclick']; i < G.length; i++)
+  addEventListener(G[i], function (e) { e.preventDefault(); }, { passive: false });
+</script>
+
 <meta name="theme-color" content="#07090d">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
